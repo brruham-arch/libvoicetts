@@ -120,13 +120,17 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
 static int lazy_espeak_init() {
     if (g_espeak_ready) return 1;
     const char* espeakData = "/storage/emulated/0/espeak-ng-data";
-    // Cek folder data dulu
-    FILE* chk = fopen(espeakData, "r");
-    if (!chk) {
-        LOGF("[TTS] WARNING: espeak-ng-data path not found: %s", espeakData);
-        // lanjut saja, espeak_Initialize akan return -1 bukan crash
-    } else { fclose(chk); LOGF("[TTS] espeak-ng-data path OK"); }
-    LOGF("[TTS] espeak_Initialize calling (RETRIEVAL mode)...");
+    // Cek file phondata — wajib ada, kalau tidak ada espeak_Initialize SIGSEGV
+    char phondata_path[256];
+    snprintf(phondata_path, sizeof(phondata_path), "%s/phondata", espeakData);
+    FILE* pf = fopen(phondata_path, "rb");
+    if (!pf) {
+        LOGF("[TTS] ERROR: phondata tidak ada di %s", phondata_path);
+        LOGF("[TTS] Salin folder espeak-ng-data dari artifact GitHub ke /storage/emulated/0/");
+        return 0;
+    }
+    fclose(pf);
+    LOGF("[TTS] phondata OK, memanggil espeak_Initialize...");
     int sr = espeak_Initialize(AUDIO_OUTPUT_RETRIEVAL, 0, espeakData, 0);
     LOGF("[TTS] espeak_Initialize returned: %d", sr);
     if (sr < 0) { LOGF("[TTS] ERROR: espeak_Initialize failed: %d", sr); return 0; }
