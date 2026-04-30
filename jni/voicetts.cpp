@@ -62,6 +62,7 @@ static pthread_mutex_t g_pcm_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // BASS stream untuk inject
 static HSTREAM g_pushStream = 0;
+static int    g_espeak_ready = 0;
 
 // ============================================================
 // BASS function pointers
@@ -116,8 +117,21 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
 // ============================================================
 // TTS API
 // ============================================================
+static int lazy_espeak_init() {
+    if (g_espeak_ready) return 1;
+    const char* espeakData = "/storage/emulated/0/espeak-ng-data";
+    int sr = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, espeakData, 0);
+    if (sr < 0) { LOGF("[TTS] ERROR: espeak_Initialize failed: %d", sr); return 0; }
+    LOGF("[TTS] eSpeak-NG init OK, sr=%d", sr);
+    espeak_SetSynthCallback(espeak_synth_cb);
+    espeak_SetVoiceByName("id");
+    g_espeak_ready = 1;
+    return 1;
+}
+
 static void _tts_speak(const char* text) {
     if (!text || !g_tts_enabled) return;
+    if (!lazy_espeak_init()) return;
     LOGF("[TTS] Speaking: %s", text);
 
     // Set parameter eSpeak
@@ -206,22 +220,11 @@ EXPORT void OnModLoad() {
     }
     LOGF("[TTS] BASS_RecordStart hooked");
 
-    // --- eSpeak-NG init ---
-    // Data path: /storage/emulated/0/espeak-ng-data
-    const char* espeakData = "/storage/emulated/0/espeak-ng-data";
-    int sr = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, espeakData, 0);
-    if (sr < 0) { LOGF("[TTS] ERROR: espeak_Initialize failed: %d", sr); return; }
-    LOGF("[TTS] eSpeak-NG init OK, samplerate=%d", sr);
-
-    espeak_SetSynthCallback(espeak_synth_cb);
-    espeak_SetVoiceByName("id");  // Bahasa Indonesia
-    LOGF("[TTS] Voice set to 'id' (Indonesian)");
-
     // Tulis addr API ke file untuk Lua
     FILE* af = fopen("/storage/emulated/0/voicetts_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&tts_api); fclose(af); }
 
-    LOGF("[TTS] OnModLoad SELESAI!");
+    LOGF("[TTS] OnModLoad SELESAI (espeak lazy)!");
 }
 
 } // extern "C"
