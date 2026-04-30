@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import os
 
-skip_dirs = {'tests', 'windows', 'include'}
+skip_dirs = {'tests', 'windows', 'ucd-tools', 'speechPlayer', 'include', 'compat'}
 
-# Source files
+# Source files - hanya dari libespeak-ng
 srcs = []
 for root, dirs, files in os.walk("jni/espeak-ng/src"):
     dirs[:] = [d for d in sorted(dirs) if d not in skip_dirs]
@@ -11,22 +11,34 @@ for root, dirs, files in os.walk("jni/espeak-ng/src"):
         if f.endswith('.c'):
             srcs.append(os.path.join(root, f).replace("jni/espeak-ng/src/", "espeak-ng/src/"))
 
+# Tambah ucd.c dari ucd-tools
+ucd_c = "jni/espeak-ng/src/ucd-tools/src/ucd.c"
+if os.path.exists(ucd_c):
+    srcs.append("espeak-ng/src/ucd-tools/src/ucd.c")
+    print("Added ucd.c from ucd-tools")
+else:
+    # Fallback: cari semua .c di ucd-tools/src
+    for root, dirs, files in os.walk("jni/espeak-ng/src/ucd-tools/src"):
+        dirs[:] = [d for d in sorted(dirs) if d != 'tests']
+        for f in sorted(files):
+            if f.endswith('.c'):
+                srcs.append(os.path.join(root, f).replace("jni/espeak-ng/src/", "espeak-ng/src/"))
+
 srcs_str = " \\\n    ".join(srcs)
 print(f"Found {len(srcs)} source files")
 
-# Include paths - yang penting: src/libespeak-ng adalah parent dari ucd/
-# setelah patch, common.c include "../ucd/ucd.h" relatif dari src/libespeak-ng/
 inc = [
     "$(LOCAL_PATH)/espeak-ng/src",
     "$(LOCAL_PATH)/espeak-ng/src/libespeak-ng",
+    "$(LOCAL_PATH)/espeak-ng/src/ucd-tools/src/include",  # <-- ucd/ucd.h ada di sini
     "$(LOCAL_PATH)/espeak-ng/src/include",
     "$(LOCAL_PATH)/espeak-ng/src/include/espeak-ng",
     "$(LOCAL_PATH)/espeak-ng/src/include/espeak",
+    "$(LOCAL_PATH)/espeak-ng/src/include/compat",
     "$(LOCAL_PATH)/espeak-ng/include",
     "$(LOCAL_PATH)/espeak-ng/include/espeak-ng",
     "$(LOCAL_PATH)/espeak-ng/include/espeak",
 ]
-
 inc_str = " \\\n    ".join(inc)
 
 # Fix include di voicetts.cpp
@@ -36,8 +48,8 @@ for root, dirs, files in os.walk("jni/espeak-ng"):
             hrel = root.replace("jni/", "")
             with open("jni/voicetts.cpp", "r") as fp:
                 c = fp.read()
-            for old in ['espeak-ng/speak_lib.h', 'espeak/speak_lib.h']:
-                c = c.replace(f'#include "{old}"', f'#include "{hrel}/speak_lib.h"')
+            c = c.replace('#include "espeak-ng/speak_lib.h"', f'#include "{hrel}/speak_lib.h"')
+            c = c.replace('#include "espeak/speak_lib.h"', f'#include "{hrel}/speak_lib.h"')
             with open("jni/voicetts.cpp", "w") as fp:
                 fp.write(c)
             print(f"Fixed include -> {hrel}/speak_lib.h")

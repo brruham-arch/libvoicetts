@@ -23,15 +23,6 @@ jobs:
     - name: Clone eSpeak-NG
       run: git clone --depth=1 https://github.com/espeak-ng/espeak-ng.git jni/espeak-ng
 
-    - name: Debug - find ucd.h location
-      run: |
-        echo "=== find ucd.h ==="
-        find jni/espeak-ng -name "ucd.h" 2>/dev/null
-        echo "=== find ucd.c ==="
-        find jni/espeak-ng -name "ucd.c" 2>/dev/null
-        echo "=== src/ tree ==="
-        find jni/espeak-ng/src -maxdepth 3 -type d
-
     - name: Build eSpeak-NG host + compile Indonesian dict
       run: |
         sudo apt-get install -y libpcaudio-dev make
