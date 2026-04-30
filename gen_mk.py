@@ -31,6 +31,7 @@ inc = [
     "$(LOCAL_PATH)/espeak-ng/src",
     "$(LOCAL_PATH)/espeak-ng/src/libespeak-ng",
     "$(LOCAL_PATH)/espeak-ng/src/ucd-tools/src/include",  # <-- ucd/ucd.h ada di sini
+    "$(LOCAL_PATH)/espeak-ng/src/speechPlayer/include",  # <-- speechPlayer.h
     "$(LOCAL_PATH)/espeak-ng/src/include",
     "$(LOCAL_PATH)/espeak-ng/src/include/espeak-ng",
     "$(LOCAL_PATH)/espeak-ng/src/include/espeak",
