@@ -154,9 +154,11 @@ struct TtsAPI {
     float (*get_speed)(void);
 };
 
+#define EXPORT __attribute__((visibility("default")))
+
 extern "C" {
 
-TtsAPI tts_api = {
+EXPORT TtsAPI tts_api = {
     _tts_speak,
     _tts_set_pitch,
     _tts_set_speed,
@@ -168,17 +170,17 @@ TtsAPI tts_api = {
     _tts_get_speed,
 };
 
-void* __GetModInfo() {
+EXPORT void* __GetModInfo() {
     static const char* info = "libvoicetts|1.0|VoiceTTS eSpeak-NG for SampVoice|brruham";
     return (void*)info;
 }
 
-void OnModPreLoad() {
+EXPORT void OnModPreLoad() {
     remove(LOGFILE);
     LOGF("[TTS] OnModPreLoad");
 }
 
-void OnModLoad() {
+EXPORT void OnModLoad() {
     LOGF("[TTS] OnModLoad start");
 
     // --- Dobby ---
