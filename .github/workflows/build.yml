@@ -26,21 +26,36 @@ jobs:
     - name: Clone eSpeak-NG
       run: git clone --depth=1 https://github.com/espeak-ng/espeak-ng.git jni/espeak-ng
 
-    - name: Build eSpeak-NG host binary
+    - name: Build eSpeak-NG host (cmake generates phondata otomatis)
       run: |
         cd jni/espeak-ng
-        cmake -B build_host -DUSE_ASYNC=OFF -DBUILD_SHARED_LIBS=OFF .
+        cmake -B build_host \
+          -DUSE_ASYNC=OFF \
+          -DBUILD_SHARED_LIBS=OFF \
+          -DESPEAK_NG_DEFAULT_VOICE=id \
+          .
+        # Full build: cmake akan compile phondata sebagai bagian dari build
         cmake --build build_host -j4
-        echo "Binary: $(ls -lh build_host/src/espeak-ng 2>/dev/null || echo MISSING)"
+        # Cari phondata di mana saja
+        echo "=== Find phondata ==="
+        find build_host -name "phondata" 2>/dev/null || echo "not in build_host"
+        find . -name "phondata" 2>/dev/null | head -5
 
-    - name: Generate phondata dari phsource/
+    - name: Copy phondata ke espeak-ng-data source tree
       run: |
         cd jni/espeak-ng
-        # phsource/ ada di repo (bukan LFS), compile jadi binary phondata
-        ESPEAK_DATA_PATH=$(pwd)/espeak-ng-data \
-          build_host/src/espeak-ng --compile-all
-        echo "=== phondata size ==="
-        wc -c espeak-ng-data/phondata
+        # phondata ada di build_host/espeak-ng-data/
+        PHDATA=$(find build_host -name "phondata" 2>/dev/null | head -1)
+        if [ -n "$PHDATA" ]; then
+          PHDIR=$(dirname "$PHDATA")
+          echo "Found phondata at: $PHDIR"
+          wc -c "$PHDATA"
+          cp -r "$PHDIR"/. espeak-ng-data/
+        else
+          echo "ERROR: phondata tidak ditemukan di build output!"
+          exit 1
+        fi
+        echo "=== espeak-ng-data ==="
         ls -lh espeak-ng-data/
 
     - name: Copy config.h
@@ -63,9 +78,8 @@ jobs:
         mkdir -p out/espeak-ng-data
         find libs/ -name "*.so" -exec cp {} out/ \;
         cp -r jni/espeak-ng/espeak-ng-data/. out/espeak-ng-data/
-        echo "=== Artifact ==="
-        ls -lh out/
         echo "phondata: $(wc -c < out/espeak-ng-data/phondata)"
+        ls -lh out/
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
