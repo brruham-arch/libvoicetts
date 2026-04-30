@@ -14,14 +14,11 @@ for root, dirs, files in os.walk("jni/espeak-ng/src"):
 srcs_str = " \\\n    ".join(srcs)
 print(f"Found {len(srcs)} source files")
 
-# Include paths - eksplisit semua yang dibutuhkan
-# <ucd/ucd.h> butuh parent dari folder ucd = src/libespeak-ng atau src
-# Kita tambah semua subfolder langsung
+# Include paths - yang penting: src/libespeak-ng adalah parent dari ucd/
+# setelah patch, common.c include "../ucd/ucd.h" relatif dari src/libespeak-ng/
 inc = [
     "$(LOCAL_PATH)/espeak-ng/src",
-    "$(LOCAL_PATH)/espeak-ng/src/libespeak-ng",  # parent dari ucd include
-    "$(LOCAL_PATH)/espeak-ng/src/ucd",
-    "$(LOCAL_PATH)/espeak-ng/src/compat",
+    "$(LOCAL_PATH)/espeak-ng/src/libespeak-ng",
     "$(LOCAL_PATH)/espeak-ng/src/include",
     "$(LOCAL_PATH)/espeak-ng/src/include/espeak-ng",
     "$(LOCAL_PATH)/espeak-ng/src/include/espeak",
@@ -29,12 +26,6 @@ inc = [
     "$(LOCAL_PATH)/espeak-ng/include/espeak-ng",
     "$(LOCAL_PATH)/espeak-ng/include/espeak",
 ]
-# Tambah semua subfolder lainnya secara dinamis
-for root, dirs, files in os.walk("jni/espeak-ng/src"):
-    dirs[:] = [d for d in sorted(dirs) if d not in skip_dirs]
-    rel = root.replace("jni/espeak-ng/src", "$(LOCAL_PATH)/espeak-ng/src")
-    if rel not in inc:
-        inc.append(rel)
 
 inc_str = " \\\n    ".join(inc)
 

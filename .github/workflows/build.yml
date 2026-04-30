@@ -35,10 +35,17 @@ jobs:
 
     - name: Patch ucd include path
       run: |
+        # Patch angle-bracket style: <ucd/ucd.h>
         find jni/espeak-ng/src -name "*.c" -o -name "*.h" | \
-          xargs grep -rl '<ucd/ucd.h>' | \
-          xargs sed -i 's|<ucd/ucd.h>|"ucd/ucd.h"|g'
+          xargs grep -rl '<ucd/ucd.h>' 2>/dev/null | \
+          xargs -r sed -i 's|<ucd/ucd.h>|"../ucd/ucd.h"|g'
+        # Patch double-quote style: "ucd/ucd.h"
+        find jni/espeak-ng/src -name "*.c" -o -name "*.h" | \
+          xargs grep -rl '"ucd/ucd.h"' 2>/dev/null | \
+          xargs -r sed -i 's|"ucd/ucd.h"|"../ucd/ucd.h"|g'
         echo "Patched ucd includes"
+        # Verifikasi
+        grep -r 'ucd.h' jni/espeak-ng/src --include="*.c" --include="*.h" | head -5
 
     - name: Copy config.h into espeak-ng src
       run: cp jni/config.h jni/espeak-ng/src/config.h
