@@ -120,10 +120,13 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
 static int lazy_espeak_init() {
     if (g_espeak_ready) return 1;
     const char* espeakData = "/storage/emulated/0/espeak-ng-data";
+    LOGF("[TTS] espeak_Initialize calling...");
     int sr = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, espeakData, 0);
+    LOGF("[TTS] espeak_Initialize returned: %d", sr);
     if (sr < 0) { LOGF("[TTS] ERROR: espeak_Initialize failed: %d", sr); return 0; }
-    LOGF("[TTS] eSpeak-NG init OK, sr=%d", sr);
+    LOGF("[TTS] SetSynthCallback...");
     espeak_SetSynthCallback(espeak_synth_cb);
+    LOGF("[TTS] SetVoiceByName...");
     espeak_SetVoiceByName("id");
     g_espeak_ready = 1;
     return 1;

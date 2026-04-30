@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import os
 
-skip_dirs = {'tests', 'windows', 'ucd-tools', 'speechPlayer', 'include', 'compat'}
+skip_dirs  = {'tests', 'windows', 'ucd-tools', 'speechPlayer', 'include', 'compat'}
+skip_files = {'sPlayer.c', 'compilembrola.c', 'getopt.c'}  # tidak dibutuhkan/crash
 
 # Source files - hanya dari libespeak-ng
 srcs = []
@@ -21,7 +22,7 @@ else:
     for root, dirs, files in os.walk("jni/espeak-ng/src/ucd-tools/src"):
         dirs[:] = [d for d in sorted(dirs) if d != 'tests']
         for f in sorted(files):
-            if f.endswith('.c'):
+            if f.endswith('.c') and f not in skip_files:
                 srcs.append(os.path.join(root, f).replace("jni/espeak-ng/src/", "espeak-ng/src/"))
 
 srcs_str = " \\\n    ".join(srcs)
@@ -31,7 +32,6 @@ inc = [
     "$(LOCAL_PATH)/espeak-ng/src",
     "$(LOCAL_PATH)/espeak-ng/src/libespeak-ng",
     "$(LOCAL_PATH)/espeak-ng/src/ucd-tools/src/include",  # <-- ucd/ucd.h ada di sini
-    "$(LOCAL_PATH)/espeak-ng/src/speechPlayer/include",  # <-- speechPlayer.h
     "$(LOCAL_PATH)/espeak-ng/src/include",
     "$(LOCAL_PATH)/espeak-ng/src/include/espeak-ng",
     "$(LOCAL_PATH)/espeak-ng/src/include/espeak",
