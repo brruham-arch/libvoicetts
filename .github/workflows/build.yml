@@ -20,29 +20,38 @@ jobs:
         ndk-version: r25b
         add-to-path: true
 
-    - name: Clone eSpeak-NG + pull LFS data
+    - name: Install dependencies
       run: |
-        sudo apt-get install -y git-lfs
-        git clone --depth=1 https://github.com/espeak-ng/espeak-ng.git jni/espeak-ng
-        cd jni/espeak-ng
-        git lfs pull
-        # Verify binary data ada (bukan LFS pointer 14 bytes)
-        echo "phondata size: $(wc -c < espeak-ng-data/phondata 2>/dev/null || echo MISSING)"
+        sudo apt-get update -q
+        sudo apt-get install -y cmake make autoconf automake libtool \
+          libpcaudio-dev libsonic-dev pkg-config
 
-    - name: Build eSpeak-NG host + compile Indonesian dict
+    - name: Clone eSpeak-NG (no LFS needed)
       run: |
-        sudo apt-get install -y libpcaudio-dev libsonic-dev ronn kramdown make
+        git clone --depth=1 https://github.com/espeak-ng/espeak-ng.git jni/espeak-ng
+
+    - name: Build eSpeak-NG host tool + generate phondata
+      run: |
         cd jni/espeak-ng
-        ./autogen.sh || true
-        ./configure --without-async --without-mbrola --without-pcaudiolib 2>/dev/null || true
-        make -j4 src/espeak-ng 2>/dev/null || true
-        # Kalau build berhasil, compile dict id
-        if [ -f src/espeak-ng ]; then
-          echo "Host build OK, compile id dict..."
-          ESPEAK_DATA_PATH=$(pwd)/espeak-ng-data src/espeak-ng --compile=id 2>/dev/null || true
-        else
-          echo "Host build skip, pakai data dari LFS"
+        # Build host espeak-ng (Ubuntu x86_64) untuk generate data
+        cmake -B build_host \
+          -DUSE_ASYNC=OFF \
+          -DBUILD_SHARED_LIBS=OFF \
+          -DESPEAK_NG_DEFAULT_VOICE=id \
+          .
+        cmake --build build_host -j4
+        # Generate semua phoneme data (phondata, phonindex, phontab, intonations, dll)
+        echo "=== Compile all phoneme data ==="
+        cmake --build build_host --target espeak-ng-data || true
+        # Fallback: jalankan manual
+        if [ ! -f espeak-ng-data/phondata ]; then
+          echo "Fallback: compile manual"
+          ESPEAK_DATA_PATH=$(pwd)/espeak-ng-data \
+            build_host/src/espeak-ng --compile-all 2>/dev/null || true
         fi
+        echo "=== Hasil espeak-ng-data ==="
+        ls -lh espeak-ng-data/
+        echo "phondata: $(wc -c < espeak-ng-data/phondata 2>/dev/null || echo MISSING)"
 
     - name: Copy config.h into espeak-ng src
       run: cp jni/config.h jni/espeak-ng/src/config.h
@@ -64,12 +73,10 @@ jobs:
         mkdir -p out/espeak-ng-data
         find libs/ -name "*.so" -exec cp {} out/ \;
         cp -r jni/espeak-ng/espeak-ng-data/. out/espeak-ng-data/
-        # Verify isi artifact
-        echo "=== out/ ==="
+        echo "=== Artifact contents ==="
         ls -lh out/
-        echo "=== out/espeak-ng-data/ (top level) ==="
-        ls -lh out/espeak-ng-data/
-        echo "phondata size: $(wc -c < out/espeak-ng-data/phondata)"
+        ls -lh out/espeak-ng-data/ | head -20
+        echo "phondata: $(wc -c < out/espeak-ng-data/phondata 2>/dev/null || echo MISSING)"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
