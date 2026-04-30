@@ -120,8 +120,14 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
 static int lazy_espeak_init() {
     if (g_espeak_ready) return 1;
     const char* espeakData = "/storage/emulated/0/espeak-ng-data";
-    LOGF("[TTS] espeak_Initialize calling...");
-    int sr = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, espeakData, 0);
+    // Cek folder data dulu
+    FILE* chk = fopen(espeakData, "r");
+    if (!chk) {
+        LOGF("[TTS] WARNING: espeak-ng-data path not found: %s", espeakData);
+        // lanjut saja, espeak_Initialize akan return -1 bukan crash
+    } else { fclose(chk); LOGF("[TTS] espeak-ng-data path OK"); }
+    LOGF("[TTS] espeak_Initialize calling (RETRIEVAL mode)...");
+    int sr = espeak_Initialize(AUDIO_OUTPUT_RETRIEVAL, 0, espeakData, 0);
     LOGF("[TTS] espeak_Initialize returned: %d", sr);
     if (sr < 0) { LOGF("[TTS] ERROR: espeak_Initialize failed: %d", sr); return 0; }
     LOGF("[TTS] SetSynthCallback...");
