@@ -25,29 +25,16 @@ jobs:
 
     - name: Build eSpeak-NG host + compile Indonesian dict
       run: |
-        sudo apt-get install -y autoconf automake libtool pkg-config libpcaudio-dev make
+        sudo apt-get install -y libpcaudio-dev make
         cd jni/espeak-ng
-        ./autogen.sh || cmake -B build_host . && cmake --build build_host || true
-        # Fallback: build via cmake
         cmake -B build_host -DUSE_ASYNC=OFF -DBUILD_SHARED_LIBS=OFF .
         cmake --build build_host --target espeak-ng -j4 || true
-        # Compile dict bahasa Indonesia
         if [ -f build_host/src/espeak-ng ]; then
-          ESPEAK_DATA_PATH=$(pwd)/espeak-ng-data build_host/src/espeak-ng \
-            --compile=id 2>/dev/null || true
+          ESPEAK_DATA_PATH=$(pwd)/espeak-ng-data build_host/src/espeak-ng --compile=id 2>/dev/null || true
         fi
-        ls espeak-ng-data/
 
-    - name: Generate config.h for Android
-      run: |
-        cat > jni/espeak-ng/src/config.h << 'CONFEOF'
-#define PACKAGE_VERSION "1.51"
-#define USE_ASYNC 0
-#define HAVE_STDINT_H 1
-#define HAVE_STDLIB_H 1
-#define HAVE_STRING_H 1
-#define PATH_ESPEAK_DATA "/storage/emulated/0/espeak-ng-data"
-CONFEOF
+    - name: Copy config.h into espeak-ng src
+      run: cp jni/config.h jni/espeak-ng/src/config.h
 
     - name: Generate Android.mk and fix includes
       run: python3 gen_mk.py
@@ -65,10 +52,8 @@ CONFEOF
       run: |
         mkdir -p out/espeak-ng-data
         find libs/ -name "*.so" -exec cp {} out/ \;
-        # Copy espeak-ng-data (lang + voices + dict)
         cp -r jni/espeak-ng/espeak-ng-data/. out/espeak-ng-data/
         ls -lh out/
-        ls out/espeak-ng-data/
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
