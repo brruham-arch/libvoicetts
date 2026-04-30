@@ -126,11 +126,18 @@ static int lazy_espeak_init() {
     FILE* pf = fopen(phondata_path, "rb");
     if (!pf) {
         LOGF("[TTS] ERROR: phondata tidak ada di %s", phondata_path);
-        LOGF("[TTS] Salin folder espeak-ng-data dari artifact GitHub ke /storage/emulated/0/");
         return 0;
     }
+    fseek(pf, 0, SEEK_END);
+    long psize = ftell(pf);
     fclose(pf);
-    LOGF("[TTS] phondata OK, memanggil espeak_Initialize...");
+    LOGF("[TTS] phondata size: %ld bytes", psize);
+    if (psize < 1000) {
+        LOGF("[TTS] ERROR: phondata %ld bytes - ini LFS pointer bukan data asli!", psize);
+        LOGF("[TTS] Jalankan CI baru (dengan git lfs pull) lalu re-download artifact.");
+        return 0;
+    }
+    LOGF("[TTS] phondata OK (%ld bytes), memanggil espeak_Initialize...", psize);
     int sr = espeak_Initialize(AUDIO_OUTPUT_RETRIEVAL, 0, espeakData, 0);
     LOGF("[TTS] espeak_Initialize returned: %d", sr);
     if (sr < 0) { LOGF("[TTS] ERROR: espeak_Initialize failed: %d", sr); return 0; }
