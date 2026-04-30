@@ -1,0 +1,6 @@
+libs/
+obj/
+build/
+*.o
+*.a
+jni/espeak-ng/

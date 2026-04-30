@@ -1,0 +1,48 @@
+name: Build libvoicetts
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Setup Android NDK
+      uses: nttld/setup-ndk@v1
+      id: setup-ndk
+      with:
+        ndk-version: r25b
+        add-to-path: true
+
+    - name: Clone eSpeak-NG
+      run: |
+        git clone --depth=1 https://github.com/espeak-ng/espeak-ng.git jni/espeak-ng
+        # Pastikan header speak_lib.h ada
+        ls jni/espeak-ng/src/include/espeak-ng/
+
+    - name: Build with NDK (ndk-build)
+      env:
+        ANDROID_NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
+      run: |
+        $ANDROID_NDK/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=jni/Android.mk \
+          NDK_APPLICATION_MK=jni/Application.mk -j4
+
+    - name: Collect output
+      run: |
+        mkdir -p out
+        find libs/ -name "*.so" -exec cp {} out/ \;
+        ls -lh out/
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: libvoicetts-armeabi-v7a
+        path: out/libvoicetts.so
