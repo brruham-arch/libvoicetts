@@ -9,7 +9,7 @@ srcs = []
 for root, dirs, files in os.walk("jni/espeak-ng/src"):
     dirs[:] = [d for d in sorted(dirs) if d not in skip_dirs]
     for f in sorted(files):
-        if f.endswith('.c'):
+        if f.endswith('.c') and f not in skip_files:
             srcs.append(os.path.join(root, f).replace("jni/espeak-ng/src/", "espeak-ng/src/"))
 
 # Tambah ucd.c dari ucd-tools
