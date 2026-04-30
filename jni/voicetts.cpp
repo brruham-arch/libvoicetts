@@ -75,13 +75,31 @@ static void* (*pDobbySymbolResolver)(const char*, const char*) = nullptr;
 static int   (*pDobbyHook)(void*, void*, void**)               = nullptr;
 
 // ============================================================
-// eSpeak callback — PCM masuk ring buffer
+// eSpeak callback — resample 22050->48000 lalu masuk ring buffer
+// Ratio = 48000/22050 ≈ 2.17687, gunakan linear interpolation
 // ============================================================
+#define ESPEAK_RATE   22050
+#define RECORD_RATE   48000
+
 static int espeak_synth_cb(short* wav, int numsamples, espeak_EVENT* events) {
     if (!wav || numsamples <= 0) return 0;
+
+    // hitung jumlah output samples setelah upsample
+    // out_count = ceil(numsamples * RECORD_RATE / ESPEAK_RATE)
+    int out_count = (int)(((long long)numsamples * RECORD_RATE + ESPEAK_RATE - 1) / ESPEAK_RATE);
+
     pthread_mutex_lock(&g_pcm_mutex);
-    for (int i = 0; i < numsamples && g_pcm_avail < PCM_BUF_SIZE; i++) {
-        g_pcm_buf[g_pcm_write] = wav[i];
+    for (int i = 0; i < out_count && g_pcm_avail < PCM_BUF_SIZE; i++) {
+        // posisi sumber dalam input array (float)
+        float src_pos = (float)i * ESPEAK_RATE / RECORD_RATE;
+        int   src_i   = (int)src_pos;
+        float frac    = src_pos - src_i;
+
+        short s0 = wav[src_i];
+        short s1 = (src_i + 1 < numsamples) ? wav[src_i + 1] : s0;
+        short out = (short)(s0 + frac * (s1 - s0));  // linear interpolation
+
+        g_pcm_buf[g_pcm_write] = out;
         g_pcm_write = (g_pcm_write + 1) % PCM_BUF_SIZE;
         g_pcm_avail++;
     }
@@ -90,25 +108,31 @@ static int espeak_synth_cb(short* wav, int numsamples, espeak_EVENT* events) {
 }
 
 // ============================================================
-// DSP callback — dipanggil BASS tiap ada mic audio dari HRECORD
-// Kalau ada TTS PCM di ring buffer, replace mic dengan TTS
+// DSP callback — replace mic dengan TTS PCM, pad silence jika kurang
 // ============================================================
 static void tts_dsp_proc(HDSP dsp, DWORD channel, void* buffer, DWORD length, void* user) {
-    short* pcm = (short*)buffer;
-    int samples = (int)(length / sizeof(short));
+    short* pcm     = (short*)buffer;
+    int    samples = (int)(length / sizeof(short));
 
     pthread_mutex_lock(&g_pcm_mutex);
-    if (g_pcm_avail >= samples) {
-        for (int i = 0; i < samples; i++) {
+    int avail_snap = g_pcm_avail;
+    if (avail_snap > 0) {
+        // ada TTS data — inject sebanyak mungkin, sisanya silence
+        int inject = avail_snap < samples ? avail_snap : samples;
+        for (int i = 0; i < inject; i++) {
             pcm[i] = g_pcm_buf[g_pcm_read];
             g_pcm_read = (g_pcm_read + 1) % PCM_BUF_SIZE;
             g_pcm_avail--;
         }
-        if (g_dsp_log_count < 5) {
+        // pad sisa frame dengan silence
+        for (int i = inject; i < samples; i++) pcm[i] = 0;
+
+        if (g_dsp_log_count < 10) {
             g_dsp_log_count++;
-            LOGF("[TTS] DSP inject %d samples ke SampVoice (avail=%d)", samples, g_pcm_avail);
+            LOGF("[TTS] DSP inject %d/%d samples (avail_left=%d)", inject, samples, g_pcm_avail);
         }
     }
+    // kalau avail==0: biarkan mic asli (jangan zero-out)
     pthread_mutex_unlock(&g_pcm_mutex);
 }
 
