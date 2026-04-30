@@ -12,8 +12,6 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-      with:
-        submodules: recursive
 
     - name: Setup Android NDK
       uses: nttld/setup-ndk@v1
@@ -25,15 +23,63 @@ jobs:
     - name: Clone eSpeak-NG
       run: |
         git clone --depth=1 https://github.com/espeak-ng/espeak-ng.git jni/espeak-ng
-        # Pastikan header speak_lib.h ada
-        ls jni/espeak-ng/src/include/espeak-ng/
 
-    - name: Build with NDK (ndk-build)
+    - name: Build eSpeak-NG (generate config headers)
+      run: |
+        sudo apt-get install -y autoconf automake libtool pkg-config
+        cd jni/espeak-ng
+        ./autogen.sh
+        ./configure --prefix=/tmp/espeak-install
+        make -j4 src/libespeak-ng.la || true
+
+    - name: Generate Android.mk dynamically
+      run: |
+        SRCS=$(find jni/espeak-ng/src -maxdepth 1 -name "*.c" | sort \
+               | sed 's|jni/espeak-ng/src/|espeak-ng/src/|g' | tr '\n' ' ')
+        UCD=$(find jni/espeak-ng/src/ucd -name "*.c" 2>/dev/null \
+              | sed 's|jni/espeak-ng/src/|espeak-ng/src/|g' | tr '\n' ' ')
+
+        HEADER=$(find jni/espeak-ng -name "speak_lib.h" | head -1 | xargs dirname)
+        HEADER_REL=$(echo $HEADER | sed 's|jni/||')
+
+        # Fix include di voicetts.cpp
+        sed -i "s|espeak-ng/speak_lib.h|$HEADER_REL/speak_lib.h|g" jni/voicetts.cpp
+
+        cat > jni/Android.mk << MKEOF
+LOCAL_PATH := \$(call my-dir)
+
+include \$(CLEAR_VARS)
+LOCAL_MODULE    := espeak-ng
+LOCAL_SRC_FILES := $SRCS $UCD
+LOCAL_C_INCLUDES := \$(LOCAL_PATH)/espeak-ng/src \
+                    \$(LOCAL_PATH)/espeak-ng/src/include \
+                    \$(LOCAL_PATH)/espeak-ng/src/include/espeak-ng \
+                    \$(LOCAL_PATH)/espeak-ng/include \
+                    \$(LOCAL_PATH)/espeak-ng/include/espeak-ng
+LOCAL_CFLAGS    := -O2 -fPIC -DANDROID -DUSE_ASYNC=0 -DLIBESPEAK_NG_EXPORT="" -Wno-error
+include \$(BUILD_STATIC_LIBRARY)
+
+include \$(CLEAR_VARS)
+LOCAL_MODULE    := voicetts
+LOCAL_SRC_FILES := voicetts.cpp
+LOCAL_C_INCLUDES := \$(LOCAL_PATH)/espeak-ng/src/include \
+                    \$(LOCAL_PATH)/espeak-ng/src/include/espeak-ng \
+                    \$(LOCAL_PATH)/espeak-ng/include \
+                    \$(LOCAL_PATH)/espeak-ng/include/espeak-ng
+LOCAL_STATIC_LIBRARIES := espeak-ng
+LOCAL_LDLIBS    := -llog -landroid -ldl -lm
+LOCAL_CPPFLAGS  := -std=c++17 -O2 -fPIC -fvisibility=hidden -DANDROID
+include \$(BUILD_SHARED_LIBRARY)
+MKEOF
+
+    - name: Build with NDK
       env:
         ANDROID_NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
       run: |
-        $ANDROID_NDK/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=jni/Android.mk \
-          NDK_APPLICATION_MK=jni/Application.mk -j4
+        $ANDROID_NDK/ndk-build NDK_PROJECT_PATH=. \
+          APP_BUILD_SCRIPT=jni/Android.mk \
+          NDK_APPLICATION_MK=jni/Application.mk \
+          -j4
 
     - name: Collect output
       run: |
