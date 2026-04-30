@@ -23,13 +23,17 @@ jobs:
     - name: Clone eSpeak-NG
       run: git clone --depth=1 https://github.com/espeak-ng/espeak-ng.git jni/espeak-ng
 
-    - name: Build eSpeak-NG host (generate config headers)
+    - name: Generate config.h for Android
       run: |
-        sudo apt-get install -y autoconf automake libtool pkg-config
-        cd jni/espeak-ng
-        ./autogen.sh
-        ./configure --prefix=/tmp/espeak-install
-        make -j4 src/libespeak-ng.la || true
+        mkdir -p jni/espeak-ng/src
+        cat > jni/espeak-ng/src/config.h << 'CONFEOF'
+        #define PACKAGE_VERSION "1.51"
+        #define USE_ASYNC 0
+        #define HAVE_STDINT_H 1
+        #define HAVE_STDLIB_H 1
+        #define HAVE_STRING_H 1
+        #define PATH_ESPEAK_DATA "/storage/emulated/0/espeak-ng-data"
+        CONFEOF
 
     - name: Generate Android.mk and fix includes
       run: python3 gen_mk.py
