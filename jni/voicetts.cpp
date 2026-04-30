@@ -71,6 +71,10 @@ static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*)    = nullp
 static HSTREAM (*pBASSStreamCreate)(DWORD,DWORD,DWORD,STREAMPROC,void*)  = nullptr;
 static DWORD   (*pBASSStreamPutData)(HSTREAM,const void*,DWORD)          = nullptr;
 static BOOL    (*pBASSChannelPlay)(HSTREAM,BOOL)                          = nullptr;
+static BASS_ChannelSetDSP_t pBASSChannelSetDSP                              = nullptr;
+
+typedef unsigned int HDSP;
+typedef HDSP (*BASS_ChannelSetDSP_t)(DWORD,void*,void*,int);
 
 // Dobby
 static void* (*pDobbySymbolResolver)(const char*, const char*) = nullptr;
@@ -90,12 +94,30 @@ static int espeak_synth_cb(short* wav, int numsamples, espeak_EVENT* events) {
     }
     pthread_mutex_unlock(&g_pcm_mutex);
 
-    // Feed ke BASS push stream kalau sudah ada
-    if (g_pushStream && pBASSStreamPutData) {
-        pBASSStreamPutData(g_pushStream, wav, (DWORD)(numsamples * sizeof(short)));
-    }
+    // Ring buffer diisi, DSP akan inject ke HRECORD saat ada audio
 
     return 0;
+}
+
+// ============================================================
+// DSP callback — dipanggil BASS tiap ada mic audio
+// Kalau ada TTS PCM di ring buffer, replace mic dengan TTS
+// ============================================================
+static void CALLBACK tts_dsp_proc(HDSP dsp, DWORD channel, void* buffer, DWORD length, void* user) {
+    short* pcm = (short*)buffer;
+    int samples = (int)(length / sizeof(short));
+
+    pthread_mutex_lock(&g_pcm_mutex);
+    if (g_pcm_avail >= samples) {
+        for (int i = 0; i < samples; i++) {
+            pcm[i] = g_pcm_buf[g_pcm_read];
+            g_pcm_read = (g_pcm_read + 1) % PCM_BUF_SIZE;
+            g_pcm_avail--;
+        }
+        LOGF("[TTS] DSP: inject %d samples ke SampVoice", samples);
+    }
+    // Kalau tidak ada TTS, mic audio lewat apa adanya
+    pthread_mutex_unlock(&g_pcm_mutex);
 }
 
 // ============================================================
@@ -106,10 +128,10 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
     HRECORD handle = orig_BASSRecordStart(freq, chans, flags, proc, user);
     LOGF("[TTS] BASSRecordStart hooked freq=%u chans=%u handle=%u", freq, chans, handle);
 
-    // Buat push stream dengan freq yang sama (biasanya 48000 mono)
-    if (pBASSStreamCreate && pBASSStreamPutData) {
-        g_pushStream = pBASSStreamCreate(freq, chans, 0, STREAMPROC_PUSH, nullptr);
-        LOGF("[TTS] Push stream created: %u", g_pushStream);
+    // Pasang DSP ke HRECORD supaya TTS PCM bisa diinject ke SampVoice
+    if (pBASSChannelSetDSP) {
+        pBASSChannelSetDSP(handle, (void*)tts_dsp_proc, nullptr, 0);
+        LOGF("[TTS] DSP installed on HRECORD %u", handle);
     }
     return handle;
 }
@@ -230,6 +252,7 @@ EXPORT void OnModLoad() {
     pBASSStreamCreate   = (HSTREAM(*)(DWORD,DWORD,DWORD,STREAMPROC,void*))dlsym(hBASS, "BASS_StreamCreate");
     pBASSStreamPutData  = (DWORD(*)(HSTREAM,const void*,DWORD))dlsym(hBASS, "BASS_StreamPutData");
     pBASSChannelPlay    = (BOOL(*)(HSTREAM,BOOL))dlsym(hBASS, "BASS_ChannelPlay");
+    pBASSChannelSetDSP  = (BASS_ChannelSetDSP_t)dlsym(hBASS, "BASS_ChannelSetDSP");
     LOGF("[TTS] BASS StreamCreate=%p PutData=%p", pBASSStreamCreate, pBASSStreamPutData);
 
     // Hook BASS_RecordStart
