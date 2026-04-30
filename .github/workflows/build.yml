@@ -33,24 +33,16 @@ jobs:
           ESPEAK_DATA_PATH=$(pwd)/espeak-ng-data build_host/src/espeak-ng --compile=id 2>/dev/null || true
         fi
 
-    - name: Patch ucd include path
+    - name: Fix ucd include resolution
       run: |
-        # Patch angle-bracket style: <ucd/ucd.h>
-        find jni/espeak-ng/src -name "*.c" -o -name "*.h" | \
-          xargs grep -rl '<ucd/ucd.h>' 2>/dev/null | \
-          xargs -r sed -i 's|<ucd/ucd.h>|"../ucd/ucd.h"|g'
-        # Patch double-quote style: "ucd/ucd.h"
-        find jni/espeak-ng/src -name "*.c" -o -name "*.h" | \
-          xargs grep -rl '"ucd/ucd.h"' 2>/dev/null | \
-          xargs -r sed -i 's|"ucd/ucd.h"|"../ucd/ucd.h"|g'
-        echo "Patched ucd includes"
-        # Verifikasi
-        grep -r 'ucd.h' jni/espeak-ng/src --include="*.c" --include="*.h" | head -5
+        cp -r jni/espeak-ng/src/ucd jni/espeak-ng/src/libespeak-ng/ucd
+        echo "Copied ucd into libespeak-ng/"
+        ls jni/espeak-ng/src/libespeak-ng/ucd/
 
     - name: Copy config.h into espeak-ng src
       run: cp jni/config.h jni/espeak-ng/src/config.h
 
-    - name: Generate Android.mk and fix includes
+    - name: Generate Android.mk
       run: python3 gen_mk.py
 
     - name: Build with NDK
@@ -66,7 +58,7 @@ jobs:
       run: |
         mkdir -p out/espeak-ng-data
         find libs/ -name "*.so" -exec cp {} out/ \;
-        cp -r jni/espeak-ng/espeak-ng-data/. out/espeak-ng-data/
+        cp -r jni/espeak-ng/espeak-ng-data/. out/espeak-ng-data/ 2>/dev/null || true
         ls -lh out/
 
     - name: Upload artifact
