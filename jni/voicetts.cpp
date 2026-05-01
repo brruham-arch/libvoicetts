@@ -78,6 +78,7 @@ static BOOL    (*pBASSChannelPause)(DWORD)                             = nullptr
 static BOOL    (*orig_BASSChannelPause)(DWORD)                         = nullptr;
 static DWORD   (*pBASSChannelIsActive)(DWORD)                          = nullptr;  // 0=stop 1=play 2=stall 3=pause
 static HDSP    (*pBASSChannelSetDSP)(DWORD,DSPPROC,void*,int)         = nullptr;
+static DWORD   (*orig_BASSChannelGetData)(DWORD,void*,DWORD)          = nullptr;
 
 // Dobby
 static void* (*pDobbySymbolResolver)(const char*, const char*) = nullptr;
@@ -108,11 +109,14 @@ static int espeak_synth_cb(short* wav, int numsamples, espeak_EVENT* events) {
 }
 
 // ============================================================
-// Proxy RECORDPROC — replace mic PCM dengan TTS saat buffer ada
+// Hook BASS_ChannelGetData — SampVoice polling mic PCM via ini
 // ============================================================
-static int hook_rec_proc(DWORD handle, const void* buf, DWORD len, void* user) {
+static DWORD hook_BASSChannelGetData(DWORD handle, void* buf, DWORD len) {
+    DWORD ret = orig_BASSChannelGetData(handle, buf, len);
+    if (handle != g_hrecord || ret == 0 || ret == (DWORD)-1) return ret;
+    // Hanya inject jika ini HRECORD mic SampVoice
     short* pcm     = (short*)buf;
-    int    samples = (int)(len / sizeof(short));
+    int    samples = (int)(ret / sizeof(short));
     pthread_mutex_lock(&g_pcm_mutex);
     int avail = g_pcm_avail;
     if (avail > 0) {
@@ -125,14 +129,11 @@ static int hook_rec_proc(DWORD handle, const void* buf, DWORD len, void* user) {
         for (int i = inject; i < samples; i++) pcm[i] = 0;
         if (g_dsp_log_count < 10) {
             g_dsp_log_count++;
-            LOGF("[TTS] proc inject %d/%d (avail_left=%d)", inject, samples, g_pcm_avail);
+            LOGF("[TTS] GetData inject %d/%d (avail_left=%d)", inject, samples, g_pcm_avail);
         }
     }
     pthread_mutex_unlock(&g_pcm_mutex);
-    // Panggil proc asli SampVoice dengan buf yang sudah kita modifikasi
-    if (g_orig_rec_proc)
-        return ((RECORDPROC_t)g_orig_rec_proc)(handle, buf, len, user);
-    return 1;  // TRUE = lanjut record
+    return ret;
 }
 
 // ============================================================
@@ -198,10 +199,8 @@ static void tts_dsp_proc(HDSP dsp, DWORD channel, void* buffer, DWORD length, vo
 // Hook BASS_RecordStart — pasang DSP ke HRECORD SampVoice
 // ============================================================
 static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* proc, void* user) {
-    // Simpan proc SampVoice, ganti dengan proxy kita
-    g_orig_rec_proc = proc;
-    HRECORD handle = orig_BASSRecordStart(freq, chans, flags, (void*)hook_rec_proc, user);
-    LOGF("[TTS] BASSRecordStart hooked freq=%u chans=%u handle=%u proc=%p", freq, chans, handle, proc);
+    HRECORD handle = orig_BASSRecordStart(freq, chans, flags, proc, user);
+    LOGF("[TTS] BASSRecordStart hooked freq=%u chans=%u handle=%u", freq, chans, handle);
 
     if (pBASSChannelSetDSP && handle) {
         g_hrecord = handle;  // simpan untuk auto-mic
@@ -337,6 +336,12 @@ EXPORT void OnModLoad() {
     if (addrPause) {
         pDobbyHook(addrPause, (void*)hook_BASSChannelPause, (void**)&orig_BASSChannelPause);
         LOGF("[TTS] BASS_ChannelPause hooked");
+
+    void* addrGetData = pDobbySymbolResolver("libBASS.so", "BASS_ChannelGetData");
+    if (addrGetData) {
+        pDobbyHook(addrGetData, (void*)hook_BASSChannelGetData, (void**)&orig_BASSChannelGetData);
+        LOGF("[TTS] BASS_ChannelGetData hooked");
+    }
     }
 
     FILE* af = fopen("/storage/emulated/0/voicetts_addr.txt", "w");
