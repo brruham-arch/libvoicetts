@@ -184,9 +184,48 @@ static void*  g_rec_user  = nullptr;
 // Forward declaration
 static void tts_dsp_proc(HDSP, DWORD, void*, DWORD, void*);
 
-// Placeholder thread — mic toggle dilakukan via Lua
+// Koordinat mic button — di-set dari Lua
+static float g_mic_btn_x = -1.0f;
+static float g_mic_btn_y = -1.0f;
+
+static void inject_mic_touch(bool press) {
+    if (g_mic_btn_x < 0 || g_mic_btn_y < 0) return;
+    char cmd[128];
+    if (press)
+        snprintf(cmd, sizeof(cmd), "input keyevent --longpress 0; input swipe %.0f %.0f %.0f %.0f 500 &",
+                 g_mic_btn_x, g_mic_btn_y, g_mic_btn_x, g_mic_btn_y);
+    else
+        snprintf(cmd, sizeof(cmd), "input tap %.0f %.0f",
+                 g_mic_btn_x, g_mic_btn_y);
+    system(cmd);
+    LOGF("[TTS] inject_touch: %s", cmd);
+}
+
 static void* tts_transmit_thread(void*) {
-    while (1) { struct timespec ts = {1, 0}; nanosleep(&ts, nullptr); }
+    struct timespec ts = {0, 100000000L};
+    while (1) {
+        nanosleep(&ts, nullptr);
+        if (g_mic_btn_x < 0) continue;
+        pthread_mutex_lock(&g_pcm_mutex);
+        int avail = g_pcm_avail;
+        pthread_mutex_unlock(&g_pcm_mutex);
+        if (avail <= 0) continue;
+        // Skip jika mic sudah aktif
+        if (orig_BASSChannelIsActive && g_hrecord &&
+            orig_BASSChannelIsActive(g_hrecord) == 1) continue;
+        LOGF("[TTS] thread: press mic (avail=%d)", avail);
+        inject_mic_touch(true);
+        // Tunggu buffer habis
+        while (1) {
+            nanosleep(&ts, nullptr);
+            pthread_mutex_lock(&g_pcm_mutex);
+            int left = g_pcm_avail;
+            pthread_mutex_unlock(&g_pcm_mutex);
+            if (left <= 0) break;
+        }
+        inject_mic_touch(false);
+        LOGF("[TTS] thread: release mic");
+    }
     return nullptr;
 }
 
@@ -295,6 +334,10 @@ static int   _tts_pcm_avail(void) {
     return a;
 }
 static unsigned int _tts_get_hrecord(void) { return (unsigned int)g_hrecord; }
+static void _tts_set_mic_pos(float x, float y) {
+    g_mic_btn_x = x; g_mic_btn_y = y;
+    LOGF("[TTS] mic_pos=%.0f,%.0f", x, y);
+}
 
 // ============================================================
 // Exported API struct
@@ -312,6 +355,7 @@ struct TtsAPI {
     void         (*notify_mic_on)(unsigned int);
     int          (*pcm_avail)(void);
     unsigned int (*get_hrecord)(void);
+    void         (*set_mic_pos)(float, float);
 };
 
 #define EXPORT __attribute__((visibility("default")))
@@ -321,7 +365,7 @@ extern "C" {
 EXPORT TtsAPI tts_api = {
     _tts_speak, _tts_set_pitch, _tts_set_speed, _tts_set_volume,
     _tts_enable, _tts_disable, _tts_is_enabled, _tts_get_pitch, _tts_get_speed,
-    _tts_notify_mic_on, _tts_pcm_avail, _tts_get_hrecord,
+    _tts_notify_mic_on, _tts_pcm_avail, _tts_get_hrecord, _tts_set_mic_pos,
 };
 
 EXPORT void* __GetModInfo() {
