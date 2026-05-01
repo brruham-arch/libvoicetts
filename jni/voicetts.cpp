@@ -279,6 +279,7 @@ static int   _tts_pcm_avail(void) {
     pthread_mutex_unlock(&g_pcm_mutex);
     return a;
 }
+static unsigned int _tts_get_hrecord(void) { return (unsigned int)g_hrecord; }
 
 // ============================================================
 // Exported API struct
@@ -293,8 +294,9 @@ struct TtsAPI {
     int   (*is_enabled)(void);
     float (*get_pitch)(void);
     float (*get_speed)(void);
-    void  (*notify_mic_on)(unsigned int);  // dipanggil Lua saat mic on
-    int   (*pcm_avail)(void);              // cek apakah ada TTS pending
+    void         (*notify_mic_on)(unsigned int);
+    int          (*pcm_avail)(void);
+    unsigned int (*get_hrecord)(void);
 };
 
 #define EXPORT __attribute__((visibility("default")))
@@ -304,7 +306,7 @@ extern "C" {
 EXPORT TtsAPI tts_api = {
     _tts_speak, _tts_set_pitch, _tts_set_speed, _tts_set_volume,
     _tts_enable, _tts_disable, _tts_is_enabled, _tts_get_pitch, _tts_get_speed,
-    _tts_notify_mic_on, _tts_pcm_avail,
+    _tts_notify_mic_on, _tts_pcm_avail, _tts_get_hrecord,
 };
 
 EXPORT void* __GetModInfo() {
