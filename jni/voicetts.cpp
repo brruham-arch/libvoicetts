@@ -159,6 +159,16 @@ static BOOL hook_BASSChannelPause(DWORD handle) {
 static volatile int g_tts_playing = 0;
 
 // Thread TTS: poll GetData saat mic off supaya inject jalan
+// Args SampVoice untuk re-trigger RecordStart
+static DWORD  g_rec_freq  = 0;
+static DWORD  g_rec_chans = 0;
+static DWORD  g_rec_flags = 0;
+static void*  g_rec_proc  = nullptr;
+static void*  g_rec_user  = nullptr;
+
+// Forward declaration
+static void tts_dsp_proc(HDSP, DWORD, void*, DWORD, void*);
+
 static void* tts_transmit_thread(void*) {
     struct timespec ts50 = {0, 50000000L};
     while (1) {
@@ -210,13 +220,6 @@ static void tts_dsp_proc(HDSP dsp, DWORD channel, void* buffer, DWORD length, vo
 // ============================================================
 // Hook BASS_RecordStart — pasang DSP ke HRECORD SampVoice
 // ============================================================
-// Args SampVoice saat panggil RecordStart — untuk re-trigger dari thread
-static DWORD  g_rec_freq  = 0;
-static DWORD  g_rec_chans = 0;
-static DWORD  g_rec_flags = 0;
-static void*  g_rec_proc  = nullptr;
-static void*  g_rec_user  = nullptr;
-
 static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* proc, void* user) {
     // Simpan args untuk dipakai thread TTS
     g_rec_freq = freq; g_rec_chans = chans; g_rec_flags = flags;
