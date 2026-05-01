@@ -58,8 +58,9 @@ static int    g_pcm_read  = 0;
 static int    g_pcm_avail = 0;
 static pthread_mutex_t g_pcm_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static int    g_espeak_ready = 0;
-static int    g_dsp_log_count = 0;  // batasi log DSP
+static int     g_espeak_ready  = 0;
+static int     g_dsp_log_count = 0;
+static HRECORD g_hrecord       = 0;   // handle mic SampVoice
 
 // ============================================================
 // BASS function pointers
@@ -67,7 +68,9 @@ static int    g_dsp_log_count = 0;  // batasi log DSP
 static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*) = nullptr;
 static HSTREAM (*pBASSStreamCreate)(DWORD,DWORD,DWORD,STREAMPROC,void*) = nullptr;
 static DWORD   (*pBASSStreamPutData)(HSTREAM,const void*,DWORD)       = nullptr;
-static BOOL    (*pBASSChannelPlay)(HSTREAM,BOOL)                       = nullptr;
+static BOOL    (*pBASSChannelPlay)(DWORD,BOOL)                         = nullptr;
+static BOOL    (*pBASSChannelPause)(DWORD)                             = nullptr;
+static DWORD   (*pBASSChannelIsActive)(DWORD)                          = nullptr;  // 0=stop 1=play 2=stall 3=pause
 static HDSP    (*pBASSChannelSetDSP)(DWORD,DSPPROC,void*,int)         = nullptr;
 
 // Dobby
@@ -76,30 +79,21 @@ static int   (*pDobbyHook)(void*, void*, void**)               = nullptr;
 
 // ============================================================
 // eSpeak callback — resample 22050->48000 lalu masuk ring buffer
-// Ratio = 48000/22050 ≈ 2.17687, gunakan linear interpolation
 // ============================================================
 #define ESPEAK_RATE   22050
 #define RECORD_RATE   48000
 
 static int espeak_synth_cb(short* wav, int numsamples, espeak_EVENT* events) {
     if (!wav || numsamples <= 0) return 0;
-
-    // hitung jumlah output samples setelah upsample
-    // out_count = ceil(numsamples * RECORD_RATE / ESPEAK_RATE)
     int out_count = (int)(((long long)numsamples * RECORD_RATE + ESPEAK_RATE - 1) / ESPEAK_RATE);
-
     pthread_mutex_lock(&g_pcm_mutex);
     for (int i = 0; i < out_count && g_pcm_avail < PCM_BUF_SIZE; i++) {
-        // posisi sumber dalam input array (float)
         float src_pos = (float)i * ESPEAK_RATE / RECORD_RATE;
         int   src_i   = (int)src_pos;
         float frac    = src_pos - src_i;
-
         short s0 = wav[src_i];
         short s1 = (src_i + 1 < numsamples) ? wav[src_i + 1] : s0;
-        short out = (short)(s0 + frac * (s1 - s0));  // linear interpolation
-
-        g_pcm_buf[g_pcm_write] = out;
+        g_pcm_buf[g_pcm_write] = (short)(s0 + frac * (s1 - s0));
         g_pcm_write = (g_pcm_write + 1) % PCM_BUF_SIZE;
         g_pcm_avail++;
     }
@@ -107,32 +101,42 @@ static int espeak_synth_cb(short* wav, int numsamples, espeak_EVENT* events) {
     return 0;
 }
 
+// g_tts_playing: 1 = kita yang aktifkan HRECORD (bukan user), perlu di-pause kembali
+static volatile int g_tts_playing = 0;
+
 // ============================================================
-// DSP callback — replace mic dengan TTS PCM, pad silence jika kurang
+// DSP callback — inject TTS PCM, auto-pause HRECORD saat selesai
 // ============================================================
 static void tts_dsp_proc(HDSP dsp, DWORD channel, void* buffer, DWORD length, void* user) {
     short* pcm     = (short*)buffer;
     int    samples = (int)(length / sizeof(short));
-
     pthread_mutex_lock(&g_pcm_mutex);
-    int avail_snap = g_pcm_avail;
-    if (avail_snap > 0) {
-        // ada TTS data — inject sebanyak mungkin, sisanya silence
-        int inject = avail_snap < samples ? avail_snap : samples;
+    int avail = g_pcm_avail;
+    if (avail > 0) {
+        int inject = avail < samples ? avail : samples;
         for (int i = 0; i < inject; i++) {
             pcm[i] = g_pcm_buf[g_pcm_read];
             g_pcm_read = (g_pcm_read + 1) % PCM_BUF_SIZE;
             g_pcm_avail--;
         }
-        // pad sisa frame dengan silence
         for (int i = inject; i < samples; i++) pcm[i] = 0;
-
         if (g_dsp_log_count < 10) {
             g_dsp_log_count++;
             LOGF("[TTS] DSP inject %d/%d samples (avail_left=%d)", inject, samples, g_pcm_avail);
         }
+        // Cek apakah buffer baru saja habis di frame ini
+        if (g_pcm_avail == 0 && g_tts_playing) {
+            g_tts_playing = 0;
+            pthread_mutex_unlock(&g_pcm_mutex);
+            // Pause hanya kalau state masih PLAYING (bukan user yang sedang mic-on)
+            if (pBASSChannelPause && pBASSChannelIsActive &&
+                pBASSChannelIsActive(g_hrecord) == 1) {
+                pBASSChannelPause(g_hrecord);
+                LOGF("[TTS] DSP: buffer habis, HRECORD paused");
+            }
+            return;
+        }
     }
-    // kalau avail==0: biarkan mic asli (jangan zero-out)
     pthread_mutex_unlock(&g_pcm_mutex);
 }
 
@@ -144,6 +148,7 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
     LOGF("[TTS] BASSRecordStart hooked freq=%u chans=%u handle=%u", freq, chans, handle);
 
     if (pBASSChannelSetDSP && handle) {
+        g_hrecord = handle;  // simpan untuk auto-mic
         pBASSChannelSetDSP(handle, tts_dsp_proc, nullptr, 0);
         LOGF("[TTS] DSP installed on HRECORD %u", handle);
     } else {
@@ -185,15 +190,31 @@ static void _tts_speak(const char* text) {
     if (!text || !g_tts_enabled) return;
     if (!lazy_espeak_init()) return;
     LOGF("[TTS] Speaking: %s", text);
-    g_dsp_log_count = 0;  // reset DSP log counter per utterance
+    g_dsp_log_count = 0;
 
     espeak_SetParameter(espeakRATE,   (int)(175 * g_tts_speed), 0);
     espeak_SetParameter(espeakPITCH,  (int)(50  * g_tts_pitch), 0);
     espeak_SetParameter(espeakVOLUME, g_tts_volume,              0);
 
+    // Synth dulu — isi ring buffer sebelum aktifkan mic
     espeak_Synth(text, strlen(text) + 1, 0, POS_CHARACTER, 0,
                  espeakCHARS_UTF8, nullptr, nullptr);
     espeak_Synchronize();
+
+    // Auto-aktifkan HRECORD — DSP akan pause sendiri saat buffer habis
+    if (g_hrecord && pBASSChannelPlay && pBASSChannelIsActive) {
+        DWORD state = pBASSChannelIsActive(g_hrecord);
+        if (state != 1) {
+            // Mic sedang off (paused/stopped) — kita yang aktifkan, tandai untuk di-pause kembali
+            g_tts_playing = 1;
+            pBASSChannelPlay(g_hrecord, 0);
+            LOGF("[TTS] HRECORD play forced (state_before=%u)", state);
+        } else {
+            // Mic sudah on oleh user — inject saja, jangan pause nanti
+            g_tts_playing = 0;
+            LOGF("[TTS] HRECORD sudah aktif (user mic-on), inject only");
+        }
+    }
 }
 
 static void  _tts_set_pitch(float v)  { g_tts_pitch  = v < 0.5f ? 0.5f : (v > 2.0f ? 2.0f : v); }
@@ -252,7 +273,9 @@ EXPORT void OnModLoad() {
     if (!hBASS) { LOGF("[TTS] ERROR: libBASS"); return; }
     pBASSStreamCreate  = (HSTREAM(*)(DWORD,DWORD,DWORD,STREAMPROC,void*))dlsym(hBASS, "BASS_StreamCreate");
     pBASSStreamPutData = (DWORD(*)(HSTREAM,const void*,DWORD))dlsym(hBASS, "BASS_StreamPutData");
-    pBASSChannelPlay   = (BOOL(*)(HSTREAM,BOOL))dlsym(hBASS, "BASS_ChannelPlay");
+    pBASSChannelPlay   = (BOOL(*)(DWORD,BOOL))dlsym(hBASS, "BASS_ChannelPlay");
+    pBASSChannelPause  = (BOOL(*)(DWORD))dlsym(hBASS, "BASS_ChannelPause");
+    pBASSChannelIsActive = (DWORD(*)(DWORD))dlsym(hBASS, "BASS_ChannelIsActive");
     pBASSChannelSetDSP = (HDSP(*)(DWORD,DSPPROC,void*,int))dlsym(hBASS, "BASS_ChannelSetDSP");
     LOGF("[TTS] BASS StreamCreate=%p PutData=%p ChannelSetDSP=%p",
          pBASSStreamCreate, pBASSStreamPutData, pBASSChannelSetDSP);
