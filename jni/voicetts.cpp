@@ -160,20 +160,36 @@ static volatile int g_tts_playing = 0;
 
 // Thread TTS: poll GetData saat mic off supaya inject jalan
 static void* tts_transmit_thread(void*) {
-    const int FRAME = 4800;
-    short buf[FRAME];
+    struct timespec ts50 = {0, 50000000L};
     while (1) {
-        struct timespec ts = {0, 100000000L};
-        nanosleep(&ts, nullptr);
-        if (!orig_BASSChannelGetData || !g_hrecord) continue;
+        nanosleep(&ts50, nullptr);
+        if (!g_rec_freq) continue;  // belum ada RecordStart
         pthread_mutex_lock(&g_pcm_mutex);
         int avail = g_pcm_avail;
         pthread_mutex_unlock(&g_pcm_mutex);
         if (avail <= 0) continue;
-        // Skip jika SampVoice sudah aktif poll sendiri
-        if (pBASSChannelIsActive && pBASSChannelIsActive(g_hrecord) == 1) continue;
-        LOGF("[TTS] thread poll GetData (avail=%d)", avail);
-        orig_BASSChannelGetData(g_hrecord, buf, FRAME * sizeof(short));
+        // Mic sudah aktif — biarkan SampVoice yang poll via GetData
+        if (pBASSChannelIsActive && g_hrecord &&
+            pBASSChannelIsActive(g_hrecord) == 1) continue;
+        // Mic off tapi ada PCM — simulasi mic on via RecordStart
+        LOGF("[TTS] thread: trigger RecordStart (avail=%d)", avail);
+        HRECORD h = orig_BASSRecordStart(g_rec_freq, g_rec_chans, g_rec_flags,
+                                          g_rec_proc, g_rec_user);
+        if (!h) { LOGF("[TTS] thread: RecordStart gagal"); continue; }
+        g_hrecord = h;
+        if (pBASSChannelSetDSP) pBASSChannelSetDSP(h, tts_dsp_proc, nullptr, 0);
+        LOGF("[TTS] thread: RecordStart OK handle=%u", h);
+        // Tunggu sampai buffer habis
+        while (1) {
+            nanosleep(&ts50, nullptr);
+            pthread_mutex_lock(&g_pcm_mutex);
+            int left = g_pcm_avail;
+            pthread_mutex_unlock(&g_pcm_mutex);
+            if (left <= 0) break;
+        }
+        // Pause HRECORD yang kita buat
+        if (pBASSChannelPause) pBASSChannelPause(h);
+        LOGF("[TTS] thread: selesai, HRECORD paused");
     }
     return nullptr;
 }
@@ -194,16 +210,23 @@ static void tts_dsp_proc(HDSP dsp, DWORD channel, void* buffer, DWORD length, vo
 // ============================================================
 // Hook BASS_RecordStart — pasang DSP ke HRECORD SampVoice
 // ============================================================
+// Args SampVoice saat panggil RecordStart — untuk re-trigger dari thread
+static DWORD  g_rec_freq  = 0;
+static DWORD  g_rec_chans = 0;
+static DWORD  g_rec_flags = 0;
+static void*  g_rec_proc  = nullptr;
+static void*  g_rec_user  = nullptr;
+
 static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* proc, void* user) {
+    // Simpan args untuk dipakai thread TTS
+    g_rec_freq = freq; g_rec_chans = chans; g_rec_flags = flags;
+    g_rec_proc = proc; g_rec_user  = user;
     HRECORD handle = orig_BASSRecordStart(freq, chans, flags, proc, user);
     LOGF("[TTS] BASSRecordStart hooked freq=%u chans=%u handle=%u", freq, chans, handle);
-
     if (pBASSChannelSetDSP && handle) {
-        g_hrecord = handle;  // simpan untuk auto-mic
+        g_hrecord = handle;
         pBASSChannelSetDSP(handle, tts_dsp_proc, nullptr, 0);
         LOGF("[TTS] DSP installed on HRECORD %u", handle);
-    } else {
-        LOGF("[TTS] WARNING: pBASSChannelSetDSP=%p handle=%u", pBASSChannelSetDSP, handle);
     }
     return handle;
 }
