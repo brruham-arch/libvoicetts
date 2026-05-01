@@ -61,6 +61,11 @@ static pthread_mutex_t g_pcm_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int     g_espeak_ready  = 0;
 static int     g_dsp_log_count = 0;
 static HRECORD g_hrecord       = 0;   // handle mic SampVoice
+static void*   g_orig_rec_proc = nullptr;  // SampVoice RECORDPROC asli
+
+// Tipe RECORDPROC BASS: BOOL(HRECORD handle, const void* buf, DWORD len, void* user)
+typedef int (*RECORDPROC_t)(DWORD, const void*, DWORD, void*);
+
 
 // ============================================================
 // BASS function pointers
@@ -100,6 +105,34 @@ static int espeak_synth_cb(short* wav, int numsamples, espeak_EVENT* events) {
     }
     pthread_mutex_unlock(&g_pcm_mutex);
     return 0;
+}
+
+// ============================================================
+// Proxy RECORDPROC — replace mic PCM dengan TTS saat buffer ada
+// ============================================================
+static int hook_rec_proc(DWORD handle, const void* buf, DWORD len, void* user) {
+    short* pcm     = (short*)buf;
+    int    samples = (int)(len / sizeof(short));
+    pthread_mutex_lock(&g_pcm_mutex);
+    int avail = g_pcm_avail;
+    if (avail > 0) {
+        int inject = avail < samples ? avail : samples;
+        for (int i = 0; i < inject; i++) {
+            pcm[i] = g_pcm_buf[g_pcm_read];
+            g_pcm_read = (g_pcm_read + 1) % PCM_BUF_SIZE;
+            g_pcm_avail--;
+        }
+        for (int i = inject; i < samples; i++) pcm[i] = 0;
+        if (g_dsp_log_count < 10) {
+            g_dsp_log_count++;
+            LOGF("[TTS] proc inject %d/%d (avail_left=%d)", inject, samples, g_pcm_avail);
+        }
+    }
+    pthread_mutex_unlock(&g_pcm_mutex);
+    // Panggil proc asli SampVoice dengan buf yang sudah kita modifikasi
+    if (g_orig_rec_proc)
+        return ((RECORDPROC_t)g_orig_rec_proc)(handle, buf, len, user);
+    return 1;  // TRUE = lanjut record
 }
 
 // ============================================================
@@ -165,8 +198,10 @@ static void tts_dsp_proc(HDSP dsp, DWORD channel, void* buffer, DWORD length, vo
 // Hook BASS_RecordStart — pasang DSP ke HRECORD SampVoice
 // ============================================================
 static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* proc, void* user) {
-    HRECORD handle = orig_BASSRecordStart(freq, chans, flags, proc, user);
-    LOGF("[TTS] BASSRecordStart hooked freq=%u chans=%u handle=%u", freq, chans, handle);
+    // Simpan proc SampVoice, ganti dengan proxy kita
+    g_orig_rec_proc = proc;
+    HRECORD handle = orig_BASSRecordStart(freq, chans, flags, (void*)hook_rec_proc, user);
+    LOGF("[TTS] BASSRecordStart hooked freq=%u chans=%u handle=%u proc=%p", freq, chans, handle, proc);
 
     if (pBASSChannelSetDSP && handle) {
         g_hrecord = handle;  // simpan untuk auto-mic
