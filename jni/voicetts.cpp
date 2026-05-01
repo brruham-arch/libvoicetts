@@ -107,9 +107,13 @@ static volatile int g_tts_playing = 0;
 // ============================================================
 // DSP callback — inject TTS PCM, auto-pause HRECORD saat selesai
 // ============================================================
+static volatile int g_dsp_call_count = 0;
 static void tts_dsp_proc(HDSP dsp, DWORD channel, void* buffer, DWORD length, void* user) {
     short* pcm     = (short*)buffer;
     int    samples = (int)(length / sizeof(short));
+    // Log pertama kali DSP dipanggil setelah TTS
+    int cc = __sync_add_and_fetch(&g_dsp_call_count, 1);
+    if (cc == 1) LOGF("[TTS] DSP first call after play (samples=%d)", samples);
     pthread_mutex_lock(&g_pcm_mutex);
     int avail = g_pcm_avail;
     if (avail > 0) {
@@ -207,8 +211,9 @@ static void _tts_speak(const char* text) {
         if (state != 1) {
             // Mic sedang off (paused/stopped) — kita yang aktifkan, tandai untuk di-pause kembali
             g_tts_playing = 1;
-            pBASSChannelPlay(g_hrecord, 0);
-            LOGF("[TTS] HRECORD play forced (state_before=%u)", state);
+            g_dsp_call_count = 0;  // reset counter
+            BOOL play_ret = pBASSChannelPlay(g_hrecord, 1);  // restart=1
+            LOGF("[TTS] HRECORD play forced (state_before=%u ret=%d)", state, play_ret);
         } else {
             // Mic sudah on oleh user — inject saja, jangan pause nanti
             g_tts_playing = 0;
