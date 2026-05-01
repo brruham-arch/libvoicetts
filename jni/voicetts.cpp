@@ -112,7 +112,7 @@ static BOOL hook_BASSChannelPause(DWORD handle) {
         pthread_mutex_unlock(&g_pcm_mutex);
         if (avail > 0) {
             LOGF("[TTS] ChannelPause BLOCKED (avail=%d)", avail);
-            return TRUE;
+            return 1;
         }
     }
     return orig_BASSChannelPause(handle);
