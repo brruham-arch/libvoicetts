@@ -169,38 +169,9 @@ static void*  g_rec_user  = nullptr;
 // Forward declaration
 static void tts_dsp_proc(HDSP, DWORD, void*, DWORD, void*);
 
+// Placeholder thread — mic toggle dilakukan via Lua
 static void* tts_transmit_thread(void*) {
-    struct timespec ts50 = {0, 50000000L};
-    while (1) {
-        nanosleep(&ts50, nullptr);
-        if (!g_rec_freq) continue;  // belum ada RecordStart
-        pthread_mutex_lock(&g_pcm_mutex);
-        int avail = g_pcm_avail;
-        pthread_mutex_unlock(&g_pcm_mutex);
-        if (avail <= 0) continue;
-        // Mic sudah aktif — biarkan SampVoice yang poll via GetData
-        if (pBASSChannelIsActive && g_hrecord &&
-            pBASSChannelIsActive(g_hrecord) == 1) continue;
-        // Mic off tapi ada PCM — simulasi mic on via RecordStart
-        LOGF("[TTS] thread: trigger RecordStart (avail=%d)", avail);
-        HRECORD h = orig_BASSRecordStart(g_rec_freq, g_rec_chans, g_rec_flags,
-                                          g_rec_proc, g_rec_user);
-        if (!h) { LOGF("[TTS] thread: RecordStart gagal"); continue; }
-        g_hrecord = h;
-        if (pBASSChannelSetDSP) pBASSChannelSetDSP(h, tts_dsp_proc, nullptr, 0);
-        LOGF("[TTS] thread: RecordStart OK handle=%u", h);
-        // Tunggu sampai buffer habis
-        while (1) {
-            nanosleep(&ts50, nullptr);
-            pthread_mutex_lock(&g_pcm_mutex);
-            int left = g_pcm_avail;
-            pthread_mutex_unlock(&g_pcm_mutex);
-            if (left <= 0) break;
-        }
-        // Pause HRECORD yang kita buat
-        if (pBASSChannelPause) pBASSChannelPause(h);
-        LOGF("[TTS] thread: selesai, HRECORD paused");
-    }
+    while (1) { struct timespec ts = {1, 0}; nanosleep(&ts, nullptr); }
     return nullptr;
 }
 
@@ -293,6 +264,22 @@ static int   _tts_is_enabled(void)    { return g_tts_enabled; }
 static float _tts_get_pitch(void)     { return g_tts_pitch; }
 static float _tts_get_speed(void)     { return g_tts_speed; }
 
+// Dipanggil dari Lua saat mic SampVoice on — update g_hrecord ke handle aktif
+static void  _tts_notify_mic_on(unsigned int handle) {
+    if (handle && handle != g_hrecord) {
+        LOGF("[TTS] notify_mic_on handle=%u (old=%u)", handle, g_hrecord);
+        g_hrecord = handle;
+        if (pBASSChannelSetDSP)
+            pBASSChannelSetDSP(handle, tts_dsp_proc, nullptr, 0);
+    }
+}
+static int   _tts_pcm_avail(void) {
+    pthread_mutex_lock(&g_pcm_mutex);
+    int a = g_pcm_avail;
+    pthread_mutex_unlock(&g_pcm_mutex);
+    return a;
+}
+
 // ============================================================
 // Exported API struct
 // ============================================================
@@ -306,6 +293,8 @@ struct TtsAPI {
     int   (*is_enabled)(void);
     float (*get_pitch)(void);
     float (*get_speed)(void);
+    void  (*notify_mic_on)(unsigned int);  // dipanggil Lua saat mic on
+    int   (*pcm_avail)(void);              // cek apakah ada TTS pending
 };
 
 #define EXPORT __attribute__((visibility("default")))
@@ -315,6 +304,7 @@ extern "C" {
 EXPORT TtsAPI tts_api = {
     _tts_speak, _tts_set_pitch, _tts_set_speed, _tts_set_volume,
     _tts_enable, _tts_disable, _tts_is_enabled, _tts_get_pitch, _tts_get_speed,
+    _tts_notify_mic_on, _tts_pcm_avail,
 };
 
 EXPORT void* __GetModInfo() {
