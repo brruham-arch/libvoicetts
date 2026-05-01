@@ -76,7 +76,8 @@ static DWORD   (*pBASSStreamPutData)(HSTREAM,const void*,DWORD)       = nullptr;
 static BOOL    (*pBASSChannelPlay)(DWORD,BOOL)                         = nullptr;
 static BOOL    (*pBASSChannelPause)(DWORD)                             = nullptr;
 static BOOL    (*orig_BASSChannelPause)(DWORD)                         = nullptr;
-static DWORD   (*pBASSChannelIsActive)(DWORD)                          = nullptr;  // 0=stop 1=play 2=stall 3=pause
+static DWORD   (*pBASSChannelIsActive)(DWORD)                          = nullptr;
+static DWORD   (*orig_BASSChannelIsActive)(DWORD)                      = nullptr;
 static HDSP    (*pBASSChannelSetDSP)(DWORD,DSPPROC,void*,int)         = nullptr;
 static DWORD   (*orig_BASSChannelGetData)(DWORD,void*,DWORD)          = nullptr;
 
@@ -138,6 +139,20 @@ static DWORD hook_BASSChannelGetData(DWORD handle, void* buf, DWORD len) {
     }
     pthread_mutex_unlock(&g_pcm_mutex);
     return ret;
+}
+
+// ============================================================
+// Hook BASS_ChannelIsActive — return 1 (PLAYING) saat TTS aktif
+// Supaya SampVoice thread mengira mic on dan mulai poll GetData
+// ============================================================
+static DWORD hook_BASSChannelIsActive(DWORD handle) {
+    if (handle == g_hrecord) {
+        pthread_mutex_lock(&g_pcm_mutex);
+        int avail = g_pcm_avail;
+        pthread_mutex_unlock(&g_pcm_mutex);
+        if (avail > 0) return 1;  // paksa PLAYING saat TTS pending
+    }
+    return orig_BASSChannelIsActive(handle);
 }
 
 // ============================================================
@@ -334,7 +349,12 @@ EXPORT void OnModLoad() {
     pBASSStreamPutData = (DWORD(*)(HSTREAM,const void*,DWORD))dlsym(hBASS, "BASS_StreamPutData");
     pBASSChannelPlay   = (BOOL(*)(DWORD,BOOL))dlsym(hBASS, "BASS_ChannelPlay");
     pBASSChannelPause  = (BOOL(*)(DWORD))dlsym(hBASS, "BASS_ChannelPause");
-    pBASSChannelIsActive = (DWORD(*)(DWORD))dlsym(hBASS, "BASS_ChannelIsActive");
+    void* addrIsActive = dlsym(hBASS, "BASS_ChannelIsActive");
+    if (addrIsActive) {
+        pDobbyHook(addrIsActive, (void*)hook_BASSChannelIsActive, (void**)&orig_BASSChannelIsActive);
+        pBASSChannelIsActive = orig_BASSChannelIsActive;
+        LOGF("[TTS] BASS_ChannelIsActive hooked");
+    }
     pBASSChannelSetDSP = (HDSP(*)(DWORD,DSPPROC,void*,int))dlsym(hBASS, "BASS_ChannelSetDSP");
     LOGF("[TTS] BASS StreamCreate=%p PutData=%p ChannelSetDSP=%p",
          pBASSStreamCreate, pBASSStreamPutData, pBASSChannelSetDSP);
