@@ -191,14 +191,17 @@ static float g_mic_btn_y = -1.0f;
 static void inject_mic_touch(bool press) {
     if (g_mic_btn_x < 0 || g_mic_btn_y < 0) return;
     char cmd[128];
+    // sendevent lebih reliable tapi butuh device path
+    // input touchscreen: ACTION_DOWN=0, ACTION_UP=1
     if (press)
-        snprintf(cmd, sizeof(cmd), "input keyevent --longpress 0; input swipe %.0f %.0f %.0f %.0f 500 &",
-                 g_mic_btn_x, g_mic_btn_y, g_mic_btn_x, g_mic_btn_y);
+        snprintf(cmd, sizeof(cmd),
+            "input touchscreen swipe %.0f %.0f %.0f %.0f 2000",
+            g_mic_btn_x, g_mic_btn_y, g_mic_btn_x, g_mic_btn_y);
     else
-        snprintf(cmd, sizeof(cmd), "input tap %.0f %.0f",
-                 g_mic_btn_x, g_mic_btn_y);
+        snprintf(cmd, sizeof(cmd), "input touchscreen tap %.0f %.0f",
+            g_mic_btn_x, g_mic_btn_y);
     system(cmd);
-    LOGF("[TTS] inject_touch: %s", cmd);
+    LOGF("[TTS] inject_touch(%s): %.0f,%.0f", press?"press":"release", g_mic_btn_x, g_mic_btn_y);
 }
 
 static void* tts_transmit_thread(void*) {
@@ -214,7 +217,20 @@ static void* tts_transmit_thread(void*) {
         if (orig_BASSChannelIsActive && g_hrecord &&
             orig_BASSChannelIsActive(g_hrecord) == 1) continue;
         LOGF("[TTS] thread: press mic (avail=%d)", avail);
-        inject_mic_touch(true);
+        // Swipe panjang (hold) di background — akan block selama durasi swipe
+        // Hitung durasi: avail samples / 48000 Hz * 1000 ms + 500ms buffer
+        int dur_ms;
+        pthread_mutex_lock(&g_pcm_mutex);
+        dur_ms = (int)((long long)g_pcm_avail * 1000 / 48000) + 500;
+        pthread_mutex_unlock(&g_pcm_mutex);
+        if (dur_ms < 500) dur_ms = 500;
+        if (dur_ms > 8000) dur_ms = 8000;  // max 8 detik
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd),
+            "input touchscreen swipe %.0f %.0f %.0f %.0f %d &",
+            g_mic_btn_x, g_mic_btn_y, g_mic_btn_x, g_mic_btn_y, dur_ms);
+        system(cmd);
+        LOGF("[TTS] swipe %dms started", dur_ms);
         // Tunggu buffer habis
         while (1) {
             nanosleep(&ts, nullptr);
@@ -223,8 +239,7 @@ static void* tts_transmit_thread(void*) {
             pthread_mutex_unlock(&g_pcm_mutex);
             if (left <= 0) break;
         }
-        inject_mic_touch(false);
-        LOGF("[TTS] thread: release mic");
+        LOGF("[TTS] thread: buffer habis, mic akan release otomatis");
     }
     return nullptr;
 }
