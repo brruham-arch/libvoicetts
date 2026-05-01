@@ -113,7 +113,11 @@ static int espeak_synth_cb(short* wav, int numsamples, espeak_EVENT* events) {
 // ============================================================
 static DWORD hook_BASSChannelGetData(DWORD handle, void* buf, DWORD len) {
     DWORD ret = orig_BASSChannelGetData(handle, buf, len);
-    if (handle != g_hrecord || ret == 0 || ret == (DWORD)-1) return ret;
+    // Skip jika bukan HRECORD mic, atau error, atau pakai BASS_DATA_* flags (bukan raw PCM)
+    if (handle != g_hrecord) return ret;
+    if (ret == 0 || ret == (DWORD)-1 || ret == (DWORD)-2) return ret;
+    if (len & 0x40000000) return ret;  // BASS_DATA_FLOAT flag
+    if (buf == nullptr) return ret;
     // Hanya inject jika ini HRECORD mic SampVoice
     short* pcm     = (short*)buf;
     int    samples = (int)(ret / sizeof(short));
