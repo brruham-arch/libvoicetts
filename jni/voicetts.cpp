@@ -156,8 +156,27 @@ static BOOL hook_BASSChannelPause(DWORD handle) {
     return orig_BASSChannelPause(handle);
 }
 
-// g_tts_playing: tidak dipakai lagi tapi jaga kompatibilitas
 static volatile int g_tts_playing = 0;
+
+// Thread TTS: poll GetData saat mic off supaya inject jalan
+static void* tts_transmit_thread(void*) {
+    const int FRAME = 4800;
+    short buf[FRAME];
+    while (1) {
+        struct timespec ts = {0, 100000000L};
+        nanosleep(&ts, nullptr);
+        if (!orig_BASSChannelGetData || !g_hrecord) continue;
+        pthread_mutex_lock(&g_pcm_mutex);
+        int avail = g_pcm_avail;
+        pthread_mutex_unlock(&g_pcm_mutex);
+        if (avail <= 0) continue;
+        // Skip jika SampVoice sudah aktif poll sendiri
+        if (pBASSChannelIsActive && pBASSChannelIsActive(g_hrecord) == 1) continue;
+        LOGF("[TTS] thread poll GetData (avail=%d)", avail);
+        orig_BASSChannelGetData(g_hrecord, buf, FRAME * sizeof(short));
+    }
+    return nullptr;
+}
 
 // ============================================================
 // DSP callback — inject TTS PCM, auto-pause HRECORD saat selesai
@@ -167,36 +186,9 @@ static void tts_dsp_proc(HDSP dsp, DWORD channel, void* buffer, DWORD length, vo
     short* pcm     = (short*)buffer;
     int    samples = (int)(length / sizeof(short));
     // Log pertama kali DSP dipanggil setelah TTS
+    // DSP hanya untuk deteksi mic aktif — inject dilakukan oleh GetData hook
     int cc = __sync_add_and_fetch(&g_dsp_call_count, 1);
-    if (cc == 1) LOGF("[TTS] DSP first call after play (samples=%d)", samples);
-    pthread_mutex_lock(&g_pcm_mutex);
-    int avail = g_pcm_avail;
-    if (avail > 0) {
-        int inject = avail < samples ? avail : samples;
-        for (int i = 0; i < inject; i++) {
-            pcm[i] = g_pcm_buf[g_pcm_read];
-            g_pcm_read = (g_pcm_read + 1) % PCM_BUF_SIZE;
-            g_pcm_avail--;
-        }
-        for (int i = inject; i < samples; i++) pcm[i] = 0;
-        if (g_dsp_log_count < 10) {
-            g_dsp_log_count++;
-            LOGF("[TTS] DSP inject %d/%d samples (avail_left=%d)", inject, samples, g_pcm_avail);
-        }
-        // Cek apakah buffer baru saja habis di frame ini
-        if (g_pcm_avail == 0 && g_tts_playing) {
-            g_tts_playing = 0;
-            pthread_mutex_unlock(&g_pcm_mutex);
-            // Pause hanya kalau state masih PLAYING (bukan user yang sedang mic-on)
-            if (pBASSChannelPause && pBASSChannelIsActive &&
-                pBASSChannelIsActive(g_hrecord) == 1) {
-                pBASSChannelPause(g_hrecord);
-                LOGF("[TTS] DSP: buffer habis, HRECORD paused");
-            }
-            return;
-        }
-    }
-    pthread_mutex_unlock(&g_pcm_mutex);
+    if (cc == 1) LOGF("[TTS] DSP: mic aktif, GetData akan inject");
 }
 
 // ============================================================
@@ -351,6 +343,10 @@ EXPORT void OnModLoad() {
     FILE* af = fopen("/storage/emulated/0/voicetts_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&tts_api); fclose(af); }
 
+    pthread_t thr;
+    pthread_create(&thr, nullptr, tts_transmit_thread, nullptr);
+    pthread_detach(thr);
+    LOGF("[TTS] transmit thread started");
     LOGF("[TTS] OnModLoad SELESAI!");
 }
 
