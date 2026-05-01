@@ -70,6 +70,7 @@ static HSTREAM (*pBASSStreamCreate)(DWORD,DWORD,DWORD,STREAMPROC,void*) = nullpt
 static DWORD   (*pBASSStreamPutData)(HSTREAM,const void*,DWORD)       = nullptr;
 static BOOL    (*pBASSChannelPlay)(DWORD,BOOL)                         = nullptr;
 static BOOL    (*pBASSChannelPause)(DWORD)                             = nullptr;
+static BOOL    (*orig_BASSChannelPause)(DWORD)                         = nullptr;
 static DWORD   (*pBASSChannelIsActive)(DWORD)                          = nullptr;  // 0=stop 1=play 2=stall 3=pause
 static HDSP    (*pBASSChannelSetDSP)(DWORD,DSPPROC,void*,int)         = nullptr;
 
@@ -101,7 +102,23 @@ static int espeak_synth_cb(short* wav, int numsamples, espeak_EVENT* events) {
     return 0;
 }
 
-// g_tts_playing: 1 = kita yang aktifkan HRECORD (bukan user), perlu di-pause kembali
+// ============================================================
+// Hook BASS_ChannelPause — block pause saat TTS sedang transmit
+// ============================================================
+static BOOL hook_BASSChannelPause(DWORD handle) {
+    if (handle == g_hrecord) {
+        pthread_mutex_lock(&g_pcm_mutex);
+        int avail = g_pcm_avail;
+        pthread_mutex_unlock(&g_pcm_mutex);
+        if (avail > 0) {
+            LOGF("[TTS] ChannelPause BLOCKED (avail=%d)", avail);
+            return TRUE;
+        }
+    }
+    return orig_BASSChannelPause(handle);
+}
+
+// g_tts_playing: tidak dipakai lagi tapi jaga kompatibilitas
 static volatile int g_tts_playing = 0;
 
 // ============================================================
@@ -205,21 +222,10 @@ static void _tts_speak(const char* text) {
                  espeakCHARS_UTF8, nullptr, nullptr);
     espeak_Synchronize();
 
-    // Auto-aktifkan HRECORD — DSP akan pause sendiri saat buffer habis
-    if (g_hrecord && pBASSChannelPlay && pBASSChannelIsActive) {
-        DWORD state = pBASSChannelIsActive(g_hrecord);
-        if (state != 1) {
-            // Mic sedang off (paused/stopped) — kita yang aktifkan, tandai untuk di-pause kembali
-            g_tts_playing = 1;
-            g_dsp_call_count = 0;  // reset counter
-            BOOL play_ret = pBASSChannelPlay(g_hrecord, 1);  // restart=1
-            LOGF("[TTS] HRECORD play forced (state_before=%u ret=%d)", state, play_ret);
-        } else {
-            // Mic sudah on oleh user — inject saja, jangan pause nanti
-            g_tts_playing = 0;
-            LOGF("[TTS] HRECORD sudah aktif (user mic-on), inject only");
-        }
-    }
+    // BASS_ChannelPause di-hook: selama avail>0, SampVoice tidak bisa pause HRECORD
+    // Jadi audio otomatis terkirim sampai buffer habis
+    g_dsp_call_count = 0;
+    LOGF("[TTS] PCM ready (avail=%d), waiting SampVoice transmit", g_pcm_avail);
 }
 
 static void  _tts_set_pitch(float v)  { g_tts_pitch  = v < 0.5f ? 0.5f : (v > 2.0f ? 2.0f : v); }
@@ -291,6 +297,12 @@ EXPORT void OnModLoad() {
         LOGF("[TTS] ERROR: DobbyHook RecordStart"); return;
     }
     LOGF("[TTS] BASS_RecordStart hooked");
+
+    void* addrPause = pDobbySymbolResolver("libBASS.so", "BASS_ChannelPause");
+    if (addrPause) {
+        pDobbyHook(addrPause, (void*)hook_BASSChannelPause, (void**)&orig_BASSChannelPause);
+        LOGF("[TTS] BASS_ChannelPause hooked");
+    }
 
     FILE* af = fopen("/storage/emulated/0/voicetts_addr.txt", "w");
     if (af) { fprintf(af, "%lu\n", (unsigned long)&tts_api); fclose(af); }
