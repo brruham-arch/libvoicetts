@@ -124,6 +124,7 @@ static DWORD hook_BASSChannelGetData(DWORD handle, void* buf, DWORD len) {
     int    samples = (int)(ret / sizeof(short));
     pthread_mutex_lock(&g_pcm_mutex);
     int avail = g_pcm_avail;
+    // Selalu silence mic asli — hanya kirim TTS PCM
     if (avail > 0) {
         int inject = avail < samples ? avail : samples;
         for (int i = 0; i < inject; i++) {
@@ -136,6 +137,9 @@ static DWORD hook_BASSChannelGetData(DWORD handle, void* buf, DWORD len) {
             g_dsp_log_count++;
             LOGF("[TTS] GetData inject %d/%d (avail_left=%d)", inject, samples, g_pcm_avail);
         }
+    } else {
+        // Tidak ada TTS — silence mic hardware
+        memset(buf, 0, ret);
     }
     pthread_mutex_unlock(&g_pcm_mutex);
     return ret;
