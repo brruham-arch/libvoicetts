@@ -49,6 +49,7 @@ static int   g_tts_enabled = 1;
 static float g_tts_pitch   = 1.0f;
 static float g_tts_speed   = 1.0f;
 static int   g_tts_volume  = 100;
+static char  g_tts_voice[64] = "id";
 
 // PCM ring buffer
 #define PCM_BUF_SIZE (48000 * 4)  // 4 detik @ 48kHz mono 16-bit
@@ -58,11 +59,11 @@ static int    g_pcm_read  = 0;
 static int    g_pcm_avail = 0;
 static pthread_mutex_t g_pcm_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static int              g_espeak_ready  = 0;
-static int              g_dsp_log_count = 0;
-static volatile int     g_dsp_call_count = 0;  // FIX: deklarasi di atas sebelum dipakai
-static HRECORD          g_hrecord       = 0;
-static void*            g_orig_rec_proc = nullptr;
+static int              g_espeak_ready   = 0;
+static int              g_dsp_log_count  = 0;
+static volatile int     g_dsp_call_count = 0;
+static HRECORD          g_hrecord        = 0;
+static void*            g_orig_rec_proc  = nullptr;
 
 typedef int (*RECORDPROC_t)(DWORD, const void*, DWORD, void*);
 
@@ -71,21 +72,19 @@ typedef int (*RECORDPROC_t)(DWORD, const void*, DWORD, void*);
 // ============================================================
 static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*) = nullptr;
 static HSTREAM (*pBASSStreamCreate)(DWORD,DWORD,DWORD,STREAMPROC,void*) = nullptr;
-static DWORD   (*pBASSStreamPutData)(HSTREAM,const void*,DWORD)       = nullptr;
-static BOOL    (*pBASSChannelPlay)(DWORD,BOOL)                         = nullptr;
-// FIX: hapus pBASSChannelPause (tidak dipakai langsung, hanya hook)
-static BOOL    (*orig_BASSChannelPause)(DWORD)                         = nullptr;
-static DWORD   (*pBASSChannelIsActive)(DWORD)                          = nullptr;
-static DWORD   (*orig_BASSChannelIsActive)(DWORD)                      = nullptr;
-static HDSP    (*pBASSChannelSetDSP)(DWORD,DSPPROC,void*,int)         = nullptr;
-static DWORD   (*orig_BASSChannelGetData)(DWORD,void*,DWORD)          = nullptr;
+static DWORD   (*pBASSStreamPutData)(HSTREAM,const void*,DWORD)         = nullptr;
+static BOOL    (*pBASSChannelPlay)(DWORD,BOOL)                           = nullptr;
+static BOOL    (*orig_BASSChannelPause)(DWORD)                           = nullptr;
+static DWORD   (*orig_BASSChannelIsActive)(DWORD)                        = nullptr;
+static HDSP    (*pBASSChannelSetDSP)(DWORD,DSPPROC,void*,int)           = nullptr;
+static DWORD   (*orig_BASSChannelGetData)(DWORD,void*,DWORD)            = nullptr;
 
 // Dobby
 static void* (*pDobbySymbolResolver)(const char*, const char*) = nullptr;
 static int   (*pDobbyHook)(void*, void*, void**)               = nullptr;
 
 // ============================================================
-// Forward declarations  — FIX: wajib ada sebelum dipakai
+// Forward declarations
 // ============================================================
 static void  tts_dsp_proc(HDSP, DWORD, void*, DWORD, void*);
 static void* tts_transmit_thread(void*);
@@ -124,6 +123,10 @@ static DWORD hook_BASSChannelGetData(DWORD handle, void* buf, DWORD len) {
     if (len & 0x40000000) return ret;
     if (buf == nullptr) return ret;
 
+    // TTS disabled — kembalikan mic asli
+    if (!g_tts_enabled) return ret;
+
+    // TTS aktif — selalu timpa mic, inject TTS jika ada, silence jika tidak ada
     short* pcm     = (short*)buf;
     int    samples = (int)(ret / sizeof(short));
     pthread_mutex_lock(&g_pcm_mutex);
@@ -161,7 +164,7 @@ static DWORD hook_BASSChannelIsActive(DWORD handle) {
 }
 
 // ============================================================
-// Hook BASS_ChannelPause — FIX: hanya di C++, Lua tidak boleh hook lagi
+// Hook BASS_ChannelPause — hanya di C++, Lua tidak boleh hook lagi
 // ============================================================
 static BOOL hook_BASSChannelPause(DWORD handle) {
     if (handle == g_hrecord) {
@@ -170,10 +173,9 @@ static BOOL hook_BASSChannelPause(DWORD handle) {
         pthread_mutex_unlock(&g_pcm_mutex);
         if (avail > 0) {
             LOGF("[TTS] ChannelPause BLOCKED (avail=%d)", avail);
-            return 1;  // pura-pura sukses tapi tidak pause
+            return 1;
         }
     }
-    // FIX: guard null — orig bisa null jika Dobby gagal
     if (orig_BASSChannelPause)
         return orig_BASSChannelPause(handle);
     return 0;
@@ -181,14 +183,12 @@ static BOOL hook_BASSChannelPause(DWORD handle) {
 
 static volatile int g_tts_playing = 0;
 
-// Args RecordStart untuk thread
 static DWORD  g_rec_freq  = 0;
 static DWORD  g_rec_chans = 0;
 static DWORD  g_rec_flags = 0;
 static void*  g_rec_proc  = nullptr;
 static void*  g_rec_user  = nullptr;
 
-// Koordinat mic button
 static float g_mic_btn_x = -1.0f;
 static float g_mic_btn_y = -1.0f;
 
@@ -213,12 +213,10 @@ static void* tts_transmit_thread(void*) {
         int avail = g_pcm_avail;
         pthread_mutex_unlock(&g_pcm_mutex);
         if (avail <= 0) continue;
-        // Skip jika mic sudah aktif
         if (orig_BASSChannelIsActive && g_hrecord &&
             orig_BASSChannelIsActive(g_hrecord) == 1) continue;
         LOGF("[TTS] thread: tap mic ON (avail=%d)", avail);
         inject_mic_tap();
-        // Tunggu mic aktif max 1 detik
         int waited = 0;
         while (waited < 10) {
             nanosleep(&ts, nullptr);
@@ -227,7 +225,6 @@ static void* tts_transmit_thread(void*) {
         }
         LOGF("[TTS] thread: mic active=%u",
              orig_BASSChannelIsActive ? orig_BASSChannelIsActive(g_hrecord) : 99);
-        // Tunggu buffer habis
         while (1) {
             nanosleep(&ts, nullptr);
             pthread_mutex_lock(&g_pcm_mutex);
@@ -235,7 +232,6 @@ static void* tts_transmit_thread(void*) {
             pthread_mutex_unlock(&g_pcm_mutex);
             if (left <= 0) break;
         }
-        // Tap OFF
         inject_mic_tap();
         LOGF("[TTS] thread: tap mic OFF");
     }
@@ -246,8 +242,6 @@ static void* tts_transmit_thread(void*) {
 // DSP callback
 // ============================================================
 static void tts_dsp_proc(HDSP dsp, DWORD channel, void* buffer, DWORD length, void* user) {
-    short* pcm     = (short*)buffer;
-    int    samples = (int)(length / sizeof(short));
     int cc = __sync_add_and_fetch(&g_dsp_call_count, 1);
     if (cc == 1) LOGF("[TTS] DSP: mic aktif, GetData akan inject");
 }
@@ -291,9 +285,9 @@ static int lazy_espeak_init() {
     if (sr < 0) { LOGF("[TTS] ERROR: espeak_Initialize failed"); return 0; }
 
     espeak_SetSynthCallback(espeak_synth_cb);
-    espeak_SetVoiceByName("id");
+    espeak_SetVoiceByName(g_tts_voice);
     g_espeak_ready = 1;
-    LOGF("[TTS] espeak ready!");
+    LOGF("[TTS] espeak ready, voice=%s", g_tts_voice);
     return 1;
 }
 
@@ -304,9 +298,11 @@ static void _tts_speak(const char* text) {
     g_dsp_log_count  = 0;
     g_dsp_call_count = 0;
 
-    espeak_SetParameter(espeakRATE,   (int)(175 * g_tts_speed), 0);
-    espeak_SetParameter(espeakPITCH,  (int)(50  * g_tts_pitch), 0);
-    espeak_SetParameter(espeakVOLUME, g_tts_volume,              0);
+    espeak_SetVoiceByName(g_tts_voice);
+    espeak_SetParameter(espeakRATE,    (int)(175 * g_tts_speed), 0);
+    espeak_SetParameter(espeakPITCH,   (int)(50  * g_tts_pitch), 0);
+    espeak_SetParameter(espeakVOLUME,  g_tts_volume,              0);
+    espeak_SetParameter(espeakWORDGAP, 10,                        0);
 
     espeak_Synth(text, strlen(text) + 1, 0, POS_CHARACTER, 0,
                  espeakCHARS_UTF8, nullptr, nullptr);
@@ -323,6 +319,13 @@ static void  _tts_disable(void)       { g_tts_enabled = 0; }
 static int   _tts_is_enabled(void)    { return g_tts_enabled; }
 static float _tts_get_pitch(void)     { return g_tts_pitch; }
 static float _tts_get_speed(void)     { return g_tts_speed; }
+
+static void _tts_set_voice(const char* voice) {
+    if (!voice || voice[0] == '\0') return;
+    snprintf(g_tts_voice, sizeof(g_tts_voice), "%s", voice);
+    if (g_espeak_ready) espeak_SetVoiceByName(g_tts_voice);
+    LOGF("[TTS] voice=%s", g_tts_voice);
+}
 
 static void _tts_notify_mic_on(unsigned int handle) {
     if (handle && handle != g_hrecord) {
@@ -364,6 +367,7 @@ struct TtsAPI {
     int          (*pcm_avail)(void);
     unsigned int (*get_hrecord)(void);
     void         (*set_mic_pos)(float, float);
+    void         (*set_voice)(const char*);
 };
 
 #define EXPORT __attribute__((visibility("default")))
@@ -374,6 +378,7 @@ EXPORT TtsAPI tts_api = {
     _tts_speak, _tts_set_pitch, _tts_set_speed, _tts_set_volume,
     _tts_enable, _tts_disable, _tts_is_enabled, _tts_get_pitch, _tts_get_speed,
     _tts_notify_mic_on, _tts_pcm_avail, _tts_get_hrecord, _tts_set_mic_pos,
+    _tts_set_voice,
 };
 
 EXPORT void* __GetModInfo() {
@@ -418,13 +423,14 @@ EXPORT void OnModLoad() {
     }
     LOGF("[TTS] BASS_RecordStart hooked");
 
-    // FIX: brace mismatch diperbaiki — addrPause dan addrGetData sejajar, tidak nested
+    // Hook BASS_ChannelPause
     void* addrPause = pDobbySymbolResolver("libBASS.so", "BASS_ChannelPause");
     if (addrPause) {
         pDobbyHook(addrPause, (void*)hook_BASSChannelPause, (void**)&orig_BASSChannelPause);
         LOGF("[TTS] BASS_ChannelPause hooked");
     }
 
+    // Hook BASS_ChannelGetData
     void* addrGetData = pDobbySymbolResolver("libBASS.so", "BASS_ChannelGetData");
     if (addrGetData) {
         pDobbyHook(addrGetData, (void*)hook_BASSChannelGetData, (void**)&orig_BASSChannelGetData);
