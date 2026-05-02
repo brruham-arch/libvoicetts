@@ -124,10 +124,6 @@ static DWORD hook_BASSChannelGetData(DWORD handle, void* buf, DWORD len) {
     if (len & 0x40000000) return ret;
     if (buf == nullptr) return ret;
 
-    // TTS disabled — kembalikan mic asli
-    if (!g_tts_enabled) return ret;
-
-    // TTS aktif — selalu timpa mic, inject TTS jika ada, silence jika tidak ada
     short* pcm     = (short*)buf;
     int    samples = (int)(ret / sizeof(short));
     pthread_mutex_lock(&g_pcm_mutex);
@@ -308,10 +304,9 @@ static void _tts_speak(const char* text) {
     g_dsp_log_count  = 0;
     g_dsp_call_count = 0;
 
-    espeak_SetParameter(espeakRATE,    (int)(175 * g_tts_speed), 0);
-    espeak_SetParameter(espeakPITCH,   (int)(50  * g_tts_pitch), 0);
-    espeak_SetParameter(espeakVOLUME,  g_tts_volume,              0);
-    espeak_SetParameter(espeakWORDGAP, 10,                        0);
+    espeak_SetParameter(espeakRATE,   (int)(175 * g_tts_speed), 0);
+    espeak_SetParameter(espeakPITCH,  (int)(50  * g_tts_pitch), 0);
+    espeak_SetParameter(espeakVOLUME, g_tts_volume,              0);
 
     espeak_Synth(text, strlen(text) + 1, 0, POS_CHARACTER, 0,
                  espeakCHARS_UTF8, nullptr, nullptr);
