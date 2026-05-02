@@ -20,13 +20,25 @@ jobs:
         ndk-version: r25b
         add-to-path: true
 
+    - name: Cache espeak-ng
+      id: cache-espeak
+      uses: actions/cache@v4
+      with:
+        path: jni/espeak-ng
+        key: espeak-ng-${{ hashFiles('jni/Android.mk') }}
+
     - name: Install dependencies
-      run: sudo apt-get install -y cmake make libpcaudio-dev libsonic-dev pkg-config
+      if: steps.cache-espeak.outputs.cache-hit != 'true'
+      run: |
+        # Hanya cmake dan make - tidak perlu libpcaudio/libsonic untuk host build Android
+        sudo apt-get install -y --no-install-recommends cmake make
 
     - name: Clone eSpeak-NG
+      if: steps.cache-espeak.outputs.cache-hit != 'true'
       run: git clone --depth=1 https://github.com/espeak-ng/espeak-ng.git jni/espeak-ng
 
-    - name: Build eSpeak-NG host (cmake generates phondata otomatis)
+    - name: Build eSpeak-NG host (generates phondata)
+      if: steps.cache-espeak.outputs.cache-hit != 'true'
       run: |
         cd jni/espeak-ng
         cmake -B build_host \
@@ -34,29 +46,11 @@ jobs:
           -DBUILD_SHARED_LIBS=OFF \
           -DESPEAK_NG_DEFAULT_VOICE=id \
           .
-        # Full build: cmake akan compile phondata sebagai bagian dari build
         cmake --build build_host -j4
-        # Cari phondata di mana saja
-        echo "=== Find phondata ==="
-        find build_host -name "phondata" 2>/dev/null || echo "not in build_host"
-        find . -name "phondata" 2>/dev/null | head -5
-
-    - name: Copy phondata ke espeak-ng-data source tree
-      run: |
-        cd jni/espeak-ng
-        # phondata ada di build_host/espeak-ng-data/
         PHDATA=$(find build_host -name "phondata" 2>/dev/null | head -1)
-        if [ -n "$PHDATA" ]; then
-          PHDIR=$(dirname "$PHDATA")
-          echo "Found phondata at: $PHDIR"
-          wc -c "$PHDATA"
-          cp -r "$PHDIR"/. espeak-ng-data/
-        else
-          echo "ERROR: phondata tidak ditemukan di build output!"
-          exit 1
-        fi
-        echo "=== espeak-ng-data ==="
-        ls -lh espeak-ng-data/
+        if [ -z "$PHDATA" ]; then echo "ERROR: phondata not found"; exit 1; fi
+        cp -r "$(dirname $PHDATA)"/. espeak-ng-data/
+        echo "phondata: $(wc -c < espeak-ng-data/phondata)"
 
     - name: Copy config.h
       run: cp jni/config.h jni/espeak-ng/src/config.h
