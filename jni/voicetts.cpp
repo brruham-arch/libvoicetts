@@ -304,9 +304,10 @@ static void _tts_speak(const char* text) {
     g_dsp_log_count  = 0;
     g_dsp_call_count = 0;
 
-    espeak_SetParameter(espeakRATE,   (int)(175 * g_tts_speed), 0);
-    espeak_SetParameter(espeakPITCH,  (int)(50  * g_tts_pitch), 0);
-    espeak_SetParameter(espeakVOLUME, g_tts_volume,              0);
+    espeak_SetParameter(espeakRATE,    (int)(175 * g_tts_speed), 0);
+    espeak_SetParameter(espeakPITCH,   (int)(50  * g_tts_pitch), 0);
+    espeak_SetParameter(espeakVOLUME,  g_tts_volume,              0);
+    espeak_SetParameter(espeakWORDGAP, 15,                        0);
 
     espeak_Synth(text, strlen(text) + 1, 0, POS_CHARACTER, 0,
                  espeakCHARS_UTF8, nullptr, nullptr);
