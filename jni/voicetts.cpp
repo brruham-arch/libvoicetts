@@ -1,6 +1,7 @@
 /**
  * voicetts.cpp - AML TTS Mod untuk SA-MP Android (SampVoice)
  * Alur: /tts <text> -> eSpeak-NG PCM -> GetData hook inject -> SampVoice encode+kirim
+ *       + optional local playback via BASS push stream
  * Author: brruham
  */
 
@@ -45,39 +46,52 @@ typedef void  (*DSPPROC)(HDSP handle, DWORD channel, void* buffer, DWORD length,
 // ============================================================
 // Globals
 // ============================================================
-static int   g_tts_enabled = 1;
-static float g_tts_pitch   = 1.0f;
-static float g_tts_speed   = 1.0f;
-static int   g_tts_volume  = 100;
-static char  g_tts_voice[64] = "id";
+static int   g_tts_enabled    = 1;
+static int   g_play_local     = 1;  // play local: default ON
+static float g_tts_pitch      = 1.0f;
+static float g_tts_speed      = 1.0f;
+static int   g_tts_volume     = 100;
+static char  g_tts_voice[64]  = "id";
 
-// PCM ring buffer
-#define PCM_BUF_SIZE (48000 * 4)  // 4 detik @ 48kHz mono 16-bit
+// PCM ring buffer (untuk inject ke mic / SampVoice)
+#define PCM_BUF_SIZE (48000 * 4)
 static short  g_pcm_buf[PCM_BUF_SIZE];
 static int    g_pcm_write = 0;
 static int    g_pcm_read  = 0;
 static int    g_pcm_avail = 0;
 static pthread_mutex_t g_pcm_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// PCM buffer lokal (terpisah, untuk speaker)
+#define LOCAL_BUF_SIZE (48000 * 4)
+static short  g_local_buf[LOCAL_BUF_SIZE];
+static int    g_local_write = 0;
+static int    g_local_read  = 0;
+static int    g_local_avail = 0;
+static pthread_mutex_t g_local_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static int              g_espeak_ready   = 0;
 static int              g_dsp_log_count  = 0;
 static volatile int     g_dsp_call_count = 0;
 static HRECORD          g_hrecord        = 0;
-static void*            g_orig_rec_proc  = nullptr;
+static HSTREAM          g_local_stream   = 0;  // push stream untuk speaker lokal
 
 typedef int (*RECORDPROC_t)(DWORD, const void*, DWORD, void*);
 
 // ============================================================
 // BASS function pointers
 // ============================================================
-static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*) = nullptr;
+static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*)   = nullptr;
 static HSTREAM (*pBASSStreamCreate)(DWORD,DWORD,DWORD,STREAMPROC,void*) = nullptr;
-static DWORD   (*pBASSStreamPutData)(HSTREAM,const void*,DWORD)         = nullptr;
-static BOOL    (*pBASSChannelPlay)(DWORD,BOOL)                           = nullptr;
-static BOOL    (*orig_BASSChannelPause)(DWORD)                           = nullptr;
-static DWORD   (*orig_BASSChannelIsActive)(DWORD)                        = nullptr;
-static HDSP    (*pBASSChannelSetDSP)(DWORD,DSPPROC,void*,int)           = nullptr;
-static DWORD   (*orig_BASSChannelGetData)(DWORD,void*,DWORD)            = nullptr;
+static DWORD   (*pBASSStreamPutData)(HSTREAM,const void*,DWORD)          = nullptr;
+static BOOL    (*pBASSChannelPlay)(DWORD,BOOL)                            = nullptr;
+static BOOL    (*orig_BASSChannelPause)(DWORD)                            = nullptr;
+static DWORD   (*orig_BASSChannelIsActive)(DWORD)                         = nullptr;
+static HDSP    (*pBASSChannelSetDSP)(DWORD,DSPPROC,void*,int)            = nullptr;
+static DWORD   (*orig_BASSChannelGetData)(DWORD,void*,DWORD)             = nullptr;
+static BOOL    (*pBASSChannelStop)(DWORD)                                 = nullptr;
+static BOOL    (*pBASSChannelSetAttribute)(DWORD,DWORD,float)             = nullptr;
+
+#define BASS_ATTRIB_VOL 2
 
 // Dobby
 static void* (*pDobbySymbolResolver)(const char*, const char*) = nullptr;
@@ -90,14 +104,17 @@ static void  tts_dsp_proc(HDSP, DWORD, void*, DWORD, void*);
 static void* tts_transmit_thread(void*);
 
 // ============================================================
-// eSpeak callback — resample 22050->48000 lalu masuk ring buffer
+// eSpeak callback — resample 22050->48000, masuk ring buffer mic + local
 // ============================================================
 #define ESPEAK_RATE   22050
 #define RECORD_RATE   48000
 
 static int espeak_synth_cb(short* wav, int numsamples, espeak_EVENT* events) {
     if (!wav || numsamples <= 0) return 0;
+
     int out_count = (int)(((long long)numsamples * RECORD_RATE + ESPEAK_RATE - 1) / ESPEAK_RATE);
+
+    // --- Ring buffer mic (untuk SampVoice transmit) ---
     pthread_mutex_lock(&g_pcm_mutex);
     for (int i = 0; i < out_count && g_pcm_avail < PCM_BUF_SIZE; i++) {
         float src_pos = (float)i * ESPEAK_RATE / RECORD_RATE;
@@ -110,7 +127,51 @@ static int espeak_synth_cb(short* wav, int numsamples, espeak_EVENT* events) {
         g_pcm_avail++;
     }
     pthread_mutex_unlock(&g_pcm_mutex);
+
+    // --- Local playback: feed ke BASS push stream ---
+    if (g_play_local && g_local_stream && pBASSStreamPutData) {
+        // Resample ke buffer sementara dulu
+        short tmp[4096];
+        int   filled = 0;
+        for (int i = 0; i < out_count && filled < 4096; i++) {
+            float src_pos = (float)i * ESPEAK_RATE / RECORD_RATE;
+            int   src_i   = (int)src_pos;
+            float frac    = src_pos - src_i;
+            short s0 = wav[src_i];
+            short s1 = (src_i + 1 < numsamples) ? wav[src_i + 1] : s0;
+            tmp[filled++] = (short)(s0 + frac * (s1 - s0));
+        }
+        pBASSStreamPutData(g_local_stream, tmp, (DWORD)(filled * sizeof(short)));
+    }
+
     return 0;
+}
+
+// ============================================================
+// Buat / destroy local playback stream
+// ============================================================
+static void create_local_stream() {
+    if (!pBASSStreamCreate || !pBASSChannelPlay) return;
+    if (g_local_stream) return;
+
+    g_local_stream = pBASSStreamCreate(RECORD_RATE, 1, 0, STREAMPROC_PUSH, nullptr);
+    if (!g_local_stream) {
+        LOGF("[TTS] ERROR: local stream create failed");
+        return;
+    }
+    // Set volume ke 100%
+    if (pBASSChannelSetAttribute)
+        pBASSChannelSetAttribute(g_local_stream, BASS_ATTRIB_VOL, 1.0f);
+
+    pBASSChannelPlay(g_local_stream, 0);
+    LOGF("[TTS] Local playback stream created: %u", g_local_stream);
+}
+
+static void destroy_local_stream() {
+    if (!g_local_stream) return;
+    if (pBASSChannelStop) pBASSChannelStop(g_local_stream);
+    g_local_stream = 0;
+    LOGF("[TTS] Local playback stream destroyed");
 }
 
 // ============================================================
@@ -122,11 +183,8 @@ static DWORD hook_BASSChannelGetData(DWORD handle, void* buf, DWORD len) {
     if (ret == 0 || ret == (DWORD)-1 || ret == (DWORD)-2) return ret;
     if (len & 0x40000000) return ret;
     if (buf == nullptr) return ret;
-
-    // TTS disabled — kembalikan mic asli
     if (!g_tts_enabled) return ret;
 
-    // TTS aktif — selalu timpa mic, inject TTS jika ada, silence jika tidak ada
     short* pcm     = (short*)buf;
     int    samples = (int)(ret / sizeof(short));
     pthread_mutex_lock(&g_pcm_mutex);
@@ -164,7 +222,7 @@ static DWORD hook_BASSChannelIsActive(DWORD handle) {
 }
 
 // ============================================================
-// Hook BASS_ChannelPause — hanya di C++, Lua tidak boleh hook lagi
+// Hook BASS_ChannelPause
 // ============================================================
 static BOOL hook_BASSChannelPause(DWORD handle) {
     if (handle == g_hrecord) {
@@ -176,21 +234,20 @@ static BOOL hook_BASSChannelPause(DWORD handle) {
             return 1;
         }
     }
-    if (orig_BASSChannelPause)
-        return orig_BASSChannelPause(handle);
+    // Jangan pause local stream kita
+    if (handle == g_local_stream) return 1;
+    if (orig_BASSChannelPause) return orig_BASSChannelPause(handle);
     return 0;
 }
 
 static volatile int g_tts_playing = 0;
-
 static DWORD  g_rec_freq  = 0;
 static DWORD  g_rec_chans = 0;
 static DWORD  g_rec_flags = 0;
 static void*  g_rec_proc  = nullptr;
 static void*  g_rec_user  = nullptr;
-
-static float g_mic_btn_x = -1.0f;
-static float g_mic_btn_y = -1.0f;
+static float  g_mic_btn_x = -1.0f;
+static float  g_mic_btn_y = -1.0f;
 
 static void inject_mic_tap() {
     if (g_mic_btn_x < 0 || g_mic_btn_y < 0) return;
@@ -298,6 +355,9 @@ static void _tts_speak(const char* text) {
     g_dsp_log_count  = 0;
     g_dsp_call_count = 0;
 
+    // Pastikan local stream siap sebelum synth
+    if (g_play_local && !g_local_stream) create_local_stream();
+
     espeak_SetVoiceByName(g_tts_voice);
     espeak_SetParameter(espeakRATE,    (int)(175 * g_tts_speed), 0);
     espeak_SetParameter(espeakPITCH,   (int)(50  * g_tts_pitch), 0);
@@ -308,7 +368,7 @@ static void _tts_speak(const char* text) {
                  espeakCHARS_UTF8, nullptr, nullptr);
     espeak_Synchronize();
 
-    LOGF("[TTS] PCM ready (avail=%d), waiting SampVoice transmit", g_pcm_avail);
+    LOGF("[TTS] PCM ready (avail=%d, local=%d)", g_pcm_avail, g_play_local);
 }
 
 static void  _tts_set_pitch(float v)  { g_tts_pitch  = v < 0.5f ? 0.5f : (v > 2.0f ? 2.0f : v); }
@@ -319,6 +379,18 @@ static void  _tts_disable(void)       { g_tts_enabled = 0; }
 static int   _tts_is_enabled(void)    { return g_tts_enabled; }
 static float _tts_get_pitch(void)     { return g_tts_pitch; }
 static float _tts_get_speed(void)     { return g_tts_speed; }
+
+static void _tts_set_play_local(int v) {
+    g_play_local = v;
+    if (v) {
+        create_local_stream();
+        LOGF("[TTS] play_local ON");
+    } else {
+        destroy_local_stream();
+        LOGF("[TTS] play_local OFF");
+    }
+}
+static int _tts_get_play_local(void) { return g_play_local; }
 
 static void _tts_set_voice(const char* voice) {
     if (!voice || voice[0] == '\0') return;
@@ -336,16 +408,14 @@ static void _tts_notify_mic_on(unsigned int handle) {
     }
 }
 
-static int _tts_pcm_avail(void) {
+static int           _tts_pcm_avail(void)    {
     pthread_mutex_lock(&g_pcm_mutex);
     int a = g_pcm_avail;
     pthread_mutex_unlock(&g_pcm_mutex);
     return a;
 }
-
-static unsigned int _tts_get_hrecord(void) { return (unsigned int)g_hrecord; }
-
-static void _tts_set_mic_pos(float x, float y) {
+static unsigned int  _tts_get_hrecord(void)  { return (unsigned int)g_hrecord; }
+static void          _tts_set_mic_pos(float x, float y) {
     g_mic_btn_x = x; g_mic_btn_y = y;
     LOGF("[TTS] mic_pos=%.0f,%.0f", x, y);
 }
@@ -368,6 +438,8 @@ struct TtsAPI {
     unsigned int (*get_hrecord)(void);
     void         (*set_mic_pos)(float, float);
     void         (*set_voice)(const char*);
+    void         (*set_play_local)(int);   // NEW
+    int          (*get_play_local)(void);  // NEW
 };
 
 #define EXPORT __attribute__((visibility("default")))
@@ -379,10 +451,11 @@ EXPORT TtsAPI tts_api = {
     _tts_enable, _tts_disable, _tts_is_enabled, _tts_get_pitch, _tts_get_speed,
     _tts_notify_mic_on, _tts_pcm_avail, _tts_get_hrecord, _tts_set_mic_pos,
     _tts_set_voice,
+    _tts_set_play_local, _tts_get_play_local,
 };
 
 EXPORT void* __GetModInfo() {
-    static const char* info = "libvoicetts|1.0|VoiceTTS eSpeak-NG for SampVoice|brruham";
+    static const char* info = "libvoicetts|1.1|VoiceTTS eSpeak-NG for SampVoice|brruham";
     return (void*)info;
 }
 
@@ -403,10 +476,15 @@ EXPORT void OnModLoad() {
     void* hBASS = dlopen("libBASS.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hBASS) { LOGF("[TTS] ERROR: libBASS"); return; }
 
-    pBASSStreamCreate  = (HSTREAM(*)(DWORD,DWORD,DWORD,STREAMPROC,void*))dlsym(hBASS, "BASS_StreamCreate");
-    pBASSStreamPutData = (DWORD(*)(HSTREAM,const void*,DWORD))dlsym(hBASS, "BASS_StreamPutData");
-    pBASSChannelPlay   = (BOOL(*)(DWORD,BOOL))dlsym(hBASS, "BASS_ChannelPlay");
-    pBASSChannelSetDSP = (HDSP(*)(DWORD,DSPPROC,void*,int))dlsym(hBASS, "BASS_ChannelSetDSP");
+    pBASSStreamCreate       = (HSTREAM(*)(DWORD,DWORD,DWORD,STREAMPROC,void*))dlsym(hBASS, "BASS_StreamCreate");
+    pBASSStreamPutData      = (DWORD(*)(HSTREAM,const void*,DWORD))dlsym(hBASS, "BASS_StreamPutData");
+    pBASSChannelPlay        = (BOOL(*)(DWORD,BOOL))dlsym(hBASS, "BASS_ChannelPlay");
+    pBASSChannelSetDSP      = (HDSP(*)(DWORD,DSPPROC,void*,int))dlsym(hBASS, "BASS_ChannelSetDSP");
+    pBASSChannelStop        = (BOOL(*)(DWORD))dlsym(hBASS, "BASS_ChannelStop");
+    pBASSChannelSetAttribute = (BOOL(*)(DWORD,DWORD,float))dlsym(hBASS, "BASS_ChannelSetAttribute");
+
+    LOGF("[TTS] BASS funcs: StreamCreate=%p PutData=%p ChannelPlay=%p",
+         pBASSStreamCreate, pBASSStreamPutData, pBASSChannelPlay);
 
     // Hook BASS_ChannelIsActive
     void* addrIsActive = dlsym(hBASS, "BASS_ChannelIsActive");
@@ -436,6 +514,9 @@ EXPORT void OnModLoad() {
         pDobbyHook(addrGetData, (void*)hook_BASSChannelGetData, (void**)&orig_BASSChannelGetData);
         LOGF("[TTS] BASS_ChannelGetData hooked");
     }
+
+    // Buat local stream kalau play_local default ON
+    if (g_play_local) create_local_stream();
 
     // Tulis alamat API ke file untuk dibaca Lua
     FILE* af = fopen("/storage/emulated/0/voicetts_addr.txt", "w");
