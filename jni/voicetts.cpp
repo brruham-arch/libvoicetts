@@ -1,6 +1,6 @@
 /**
  * voicetts.cpp - AML TTS Mod untuk SA-MP Android (SampVoice)
- * Alur: /tts <text> -> Piper TTS PCM -> GetData hook inject -> SampVoice encode+kirim
+ * Alur: /tts <text> -> sherpa-onnx (Piper VITS) -> GetData hook inject -> SampVoice
  *       + optional local playback via BASS push stream
  * Author: brruham
  */
@@ -14,8 +14,10 @@
 #include <stdlib.h>
 #include <pthread.h>
 
-#define LOG_TAG  "libvoicetts"
-#define LOGFILE  "/storage/emulated/0/voicetts_log.txt"
+#include "sherpa-onnx/sherpa-onnx-c-api.h"
+
+#define LOG_TAG "libvoicetts"
+#define LOGFILE "/storage/emulated/0/voicetts_log.txt"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 static void logf_impl(const char* msg) {
@@ -37,27 +39,22 @@ typedef int          BOOL;
 typedef DWORD (*STREAMPROC)(HSTREAM handle, void* buffer, DWORD length, void* user);
 typedef void  (*DSPPROC)(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user);
 
-#define BASS_STREAM_DECODE  0x200000
-#define STREAMPROC_PUSH     ((STREAMPROC)-1)
-#define BASS_ATTRIB_VOL     2
+#define STREAMPROC_PUSH  ((STREAMPROC)-1)
+#define BASS_ATTRIB_VOL  2
 
 // ============================================================
-// Piper config
+// Config
 // ============================================================
-#define PIPER_BIN     "/sdcard/piper/piper"
-#define PIPER_MODELS  "/sdcard/piper"
-#define RECORD_RATE   48000
+#define MODEL_DIR   "/sdcard/piper"
+#define RECORD_RATE 48000
 
-static char  g_piper_model[256] = "id_ID-argenia-medium.onnx";
-static int   g_piper_rate       = 22050;  // sample rate model, set dari Lua jika beda
-static float g_tts_speed        = 1.0f;
-static float g_tts_pitch        = 1.0f;  // Piper tidak support pitch langsung, reserved
-static int   g_tts_volume       = 100;
-static int   g_tts_enabled      = 1;
-static int   g_play_local       = 1;
+static char  g_model[256]    = "id_ID-news_tts-medium.onnx";
+static float g_tts_speed     = 1.0f;
+static int   g_tts_enabled   = 1;
+static int   g_play_local    = 1;
 
 // ============================================================
-// Ring buffer mic (untuk SampVoice inject)
+// Ring buffer mic
 // ============================================================
 #define PCM_BUF_SIZE (48000 * 8)
 static short           g_pcm_buf[PCM_BUF_SIZE];
@@ -67,18 +64,31 @@ static int             g_pcm_avail = 0;
 static pthread_mutex_t g_pcm_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ============================================================
+// sherpa-onnx function pointers (dlopen)
+// ============================================================
+static const SherpaOnnxOfflineTts* (*pCreateOfflineTts)(const SherpaOnnxOfflineTtsConfig*)             = nullptr;
+static void                        (*pDestroyOfflineTts)(const SherpaOnnxOfflineTts*)                   = nullptr;
+static const SherpaOnnxGeneratedAudio* (*pOfflineTtsGenerate)(const SherpaOnnxOfflineTts*, const char*, int32_t, float) = nullptr;
+static void                        (*pDestroyGeneratedAudio)(const SherpaOnnxGeneratedAudio*)           = nullptr;
+static int32_t                     (*pOfflineTtsSampleRate)(const SherpaOnnxOfflineTts*)                = nullptr;
+
+static void*                    g_sherpa_handle = nullptr;
+static const SherpaOnnxOfflineTts* g_tts_engine = nullptr;
+static pthread_mutex_t          g_engine_mutex  = PTHREAD_MUTEX_INITIALIZER;
+
+// ============================================================
 // BASS function pointers
 // ============================================================
-static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*)    = nullptr;
-static HSTREAM (*pBASSStreamCreate)(DWORD,DWORD,DWORD,STREAMPROC,void*)  = nullptr;
-static DWORD   (*pBASSStreamPutData)(HSTREAM,const void*,DWORD)           = nullptr;
-static BOOL    (*pBASSChannelPlay)(DWORD,BOOL)                             = nullptr;
-static BOOL    (*orig_BASSChannelPause)(DWORD)                             = nullptr;
-static DWORD   (*orig_BASSChannelIsActive)(DWORD)                          = nullptr;
-static HDSP    (*pBASSChannelSetDSP)(DWORD,DSPPROC,void*,int)             = nullptr;
-static DWORD   (*orig_BASSChannelGetData)(DWORD,void*,DWORD)              = nullptr;
-static BOOL    (*pBASSChannelStop)(DWORD)                                  = nullptr;
-static BOOL    (*pBASSChannelSetAttribute)(DWORD,DWORD,float)              = nullptr;
+static HRECORD (*orig_BASSRecordStart)(DWORD,DWORD,DWORD,void*,void*)   = nullptr;
+static HSTREAM (*pBASSStreamCreate)(DWORD,DWORD,DWORD,STREAMPROC,void*) = nullptr;
+static DWORD   (*pBASSStreamPutData)(HSTREAM,const void*,DWORD)          = nullptr;
+static BOOL    (*pBASSChannelPlay)(DWORD,BOOL)                            = nullptr;
+static BOOL    (*orig_BASSChannelPause)(DWORD)                            = nullptr;
+static DWORD   (*orig_BASSChannelIsActive)(DWORD)                         = nullptr;
+static HDSP    (*pBASSChannelSetDSP)(DWORD,DSPPROC,void*,int)            = nullptr;
+static DWORD   (*orig_BASSChannelGetData)(DWORD,void*,DWORD)             = nullptr;
+static BOOL    (*pBASSChannelStop)(DWORD)                                 = nullptr;
+static BOOL    (*pBASSChannelSetAttribute)(DWORD,DWORD,float)             = nullptr;
 
 // Dobby
 static void* (*pDobbySymbolResolver)(const char*, const char*) = nullptr;
@@ -87,47 +97,51 @@ static int   (*pDobbyHook)(void*, void*, void**)               = nullptr;
 // ============================================================
 // Globals
 // ============================================================
-static HRECORD          g_hrecord       = 0;
-static HSTREAM          g_local_stream  = 0;
-static int              g_dsp_log_count = 0;
-static volatile int     g_dsp_call_count= 0;
-static float            g_mic_btn_x     = -1.0f;
-static float            g_mic_btn_y     = -1.0f;
+static HRECORD      g_hrecord      = 0;
+static HSTREAM      g_local_stream = 0;
+static int          g_dsp_log_count= 0;
+static volatile int g_dsp_call_count=0;
+static float        g_mic_btn_x    = -1.0f;
+static float        g_mic_btn_y    = -1.0f;
 
 // ============================================================
-// Resample helper: src_rate -> RECORD_RATE (linear interp)
-// feed langsung ke g_pcm_buf dan local stream
+// Feed float PCM [-1,1] → resample ke RECORD_RATE → ring buffer + local
 // ============================================================
-static void feed_pcm(const short* src, int src_samples, int src_rate) {
-    if (!src || src_samples <= 0) return;
+static void feed_float_pcm(const float* src, int src_n, int src_rate) {
+    if (!src || src_n <= 0) return;
 
-    int out_count = (int)(((long long)src_samples * RECORD_RATE + src_rate - 1) / src_rate);
+    int out_n = (int)(((long long)src_n * RECORD_RATE + src_rate - 1) / src_rate);
 
-    // --- mic ring buffer ---
+    // mic ring buffer
     pthread_mutex_lock(&g_pcm_mutex);
-    for (int i = 0; i < out_count && g_pcm_avail < PCM_BUF_SIZE; i++) {
+    for (int i = 0; i < out_n && g_pcm_avail < PCM_BUF_SIZE; i++) {
         float pos  = (float)i * src_rate / RECORD_RATE;
         int   idx  = (int)pos;
         float frac = pos - idx;
-        short s0   = src[idx];
-        short s1   = (idx + 1 < src_samples) ? src[idx + 1] : s0;
-        g_pcm_buf[g_pcm_write] = (short)(s0 + frac * (s1 - s0));
+        float s0   = src[idx];
+        float s1   = (idx + 1 < src_n) ? src[idx + 1] : s0;
+        float s    = s0 + frac * (s1 - s0);
+        // clamp + convert float->short
+        s = s > 1.0f ? 1.0f : (s < -1.0f ? -1.0f : s);
+        g_pcm_buf[g_pcm_write] = (short)(s * 32767.0f);
         g_pcm_write = (g_pcm_write + 1) % PCM_BUF_SIZE;
         g_pcm_avail++;
     }
     pthread_mutex_unlock(&g_pcm_mutex);
 
-    // --- local playback ---
+    // local playback
     if (g_play_local && g_local_stream && pBASSStreamPutData) {
         short tmp[4096];
         int   filled = 0;
-        for (int i = 0; i < out_count; i++) {
+        for (int i = 0; i < out_n; i++) {
             float pos  = (float)i * src_rate / RECORD_RATE;
             int   idx  = (int)pos;
             float frac = pos - idx;
-            short s0   = src[idx];
-            short s1   = (idx + 1 < src_samples) ? src[idx + 1] : s0;
-            tmp[filled++] = (short)(s0 + frac * (s1 - s0));
+            float s0   = src[idx];
+            float s1   = (idx + 1 < src_n) ? src[idx + 1] : s0;
+            float s    = s0 + frac * (s1 - s0);
+            s = s > 1.0f ? 1.0f : (s < -1.0f ? -1.0f : s);
+            tmp[filled++] = (short)(s * 32767.0f);
             if (filled == 4096) {
                 pBASSStreamPutData(g_local_stream, tmp, (DWORD)(filled * sizeof(short)));
                 filled = 0;
@@ -148,75 +162,101 @@ static void create_local_stream() {
     if (pBASSChannelSetAttribute)
         pBASSChannelSetAttribute(g_local_stream, BASS_ATTRIB_VOL, 1.0f);
     pBASSChannelPlay(g_local_stream, 0);
-    LOGF("[TTS] local stream created: %u", g_local_stream);
+    LOGF("[TTS] local stream: %u", g_local_stream);
 }
 
 static void destroy_local_stream() {
     if (!g_local_stream) return;
     if (pBASSChannelStop) pBASSChannelStop(g_local_stream);
     g_local_stream = 0;
-    LOGF("[TTS] local stream destroyed");
 }
 
 // ============================================================
-// Piper speak — blocking, dipanggil dari speak thread
+// sherpa-onnx engine: init / reinit
 // ============================================================
-static void piper_speak_sync(const char* text) {
-    if (!text || text[0] == '\0') return;
-
-    // Sanitize text: ganti ' dengan spasi supaya tidak rusak shell
-    char safe_text[512];
-    int  j = 0;
-    for (int i = 0; text[i] && j < 510; i++) {
-        safe_text[j++] = (text[i] == '\'') ? ' ' : text[i];
+static int init_tts_engine() {
+    if (!pCreateOfflineTts || !pDestroyOfflineTts ||
+        !pOfflineTtsGenerate || !pDestroyGeneratedAudio) {
+        LOGF("[TTS] ERROR: sherpa symbols not loaded");
+        return 0;
     }
-    safe_text[j] = '\0';
 
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-        "echo '%s' | %s --model %s/%s --output_raw --length_scale %.2f 2>/dev/null",
-        safe_text,
-        PIPER_BIN,
-        PIPER_MODELS,
-        g_piper_model,
-        1.0f / g_tts_speed   // length_scale: 1.0=normal, >1=lambat, <1=cepat
-    );
+    pthread_mutex_lock(&g_engine_mutex);
 
-    LOGF("[TTS] piper cmd: %s", cmd);
-
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe) { LOGF("[TTS] ERROR: popen failed"); return; }
-
-    if (g_play_local && !g_local_stream) create_local_stream();
-
-    short buf[4096];
-    size_t n;
-    int total = 0;
-    while ((n = fread(buf, sizeof(short), 4096, pipe)) > 0) {
-        feed_pcm(buf, (int)n, g_piper_rate);
-        total += (int)n;
+    // Destroy existing engine kalau ada
+    if (g_tts_engine) {
+        pDestroyOfflineTts(g_tts_engine);
+        g_tts_engine = nullptr;
     }
-    pclose(pipe);
 
-    LOGF("[TTS] piper done, total_samples=%d pcm_avail=%d", total, g_pcm_avail);
+    char model_path[512];
+    char tokens_path[512];
+    snprintf(model_path,  sizeof(model_path),  "%s/%s",        MODEL_DIR, g_model);
+    snprintf(tokens_path, sizeof(tokens_path), "%s/%s.json",   MODEL_DIR, g_model);
+
+    SherpaOnnxOfflineTtsConfig config;
+    memset(&config, 0, sizeof(config));
+
+    config.model.vits.model      = model_path;
+    config.model.vits.tokens     = tokens_path;
+    config.model.vits.data_dir   = nullptr;
+    config.model.vits.lexicon    = nullptr;
+    config.model.vits.noise_scale   = 0.667f;
+    config.model.vits.noise_scale_w = 0.8f;
+    config.model.vits.length_scale  = 1.0f / g_tts_speed;
+    config.model.num_threads     = 2;
+    config.model.provider        = "cpu";
+    config.model.debug           = 0;
+    config.max_num_sentences     = 1;
+
+    g_tts_engine = pCreateOfflineTts(&config);
+    pthread_mutex_unlock(&g_engine_mutex);
+
+    if (!g_tts_engine) {
+        LOGF("[TTS] ERROR: CreateOfflineTts failed (model=%s)", model_path);
+        return 0;
+    }
+
+    int sr = pOfflineTtsSampleRate(g_tts_engine);
+    LOGF("[TTS] engine ready, model=%s rate=%d", g_model, sr);
+    return 1;
 }
 
 // ============================================================
-// Speak thread — supaya _tts_speak tidak blocking game thread
+// Speak thread
 // ============================================================
-struct SpeakJob {
-    char text[512];
-};
+struct SpeakJob { char text[512]; };
 
 static void* speak_thread_func(void* arg) {
     SpeakJob* job = (SpeakJob*)arg;
-    piper_speak_sync(job->text);
+
+    if (!g_tts_engine) {
+        LOGF("[TTS] engine null, skip");
+        free(job); return nullptr;
+    }
+
+    if (g_play_local && !g_local_stream) create_local_stream();
+
+    pthread_mutex_lock(&g_engine_mutex);
+    const SherpaOnnxGeneratedAudio* audio =
+        pOfflineTtsGenerate(g_tts_engine, job->text, 0, g_tts_speed);
+    pthread_mutex_unlock(&g_engine_mutex);
+
+    if (!audio) {
+        LOGF("[TTS] generate failed");
+        free(job); return nullptr;
+    }
+
+    LOGF("[TTS] generated n=%d rate=%d", audio->n, audio->sample_rate);
+    feed_float_pcm(audio->samples, audio->n, audio->sample_rate);
+    pDestroyGeneratedAudio(audio);
+
     free(job);
     return nullptr;
 }
 
 static void _tts_speak(const char* text) {
-    if (!text || !g_tts_enabled) return;
+    if (!text || !g_tts_enabled || !g_tts_engine) return;
     LOGF("[TTS] speak: %s", text);
     g_dsp_log_count  = 0;
     g_dsp_call_count = 0;
@@ -296,13 +336,12 @@ static HRECORD hook_BASSRecordStart(DWORD freq, DWORD chans, DWORD flags, void* 
     if (pBASSChannelSetDSP && handle) {
         g_hrecord = handle;
         pBASSChannelSetDSP(handle, tts_dsp_proc, nullptr, 0);
-        LOGF("[TTS] DSP installed on %u", handle);
     }
     return handle;
 }
 
 // ============================================================
-// Transmit thread (mic tap)
+// Transmit thread
 // ============================================================
 static void inject_mic_tap() {
     if (g_mic_btn_x < 0 || g_mic_btn_y < 0) return;
@@ -345,52 +384,53 @@ static void* tts_transmit_thread(void*) {
 }
 
 // ============================================================
-// API setters
+// API
 // ============================================================
-static void  _tts_set_pitch(float v)      { g_tts_pitch  = v; } // reserved
-static void  _tts_set_speed(float v)      { g_tts_speed  = v < 0.5f ? 0.5f : (v > 3.0f ? 3.0f : v); }
-static void  _tts_set_volume(int v)       { g_tts_volume = v; } // reserved, kontrol via BASS
-static void  _tts_enable(void)            { g_tts_enabled = 1; }
-static void  _tts_disable(void)           { g_tts_enabled = 0; }
-static int   _tts_is_enabled(void)        { return g_tts_enabled; }
-static float _tts_get_pitch(void)         { return g_tts_pitch; }
-static float _tts_get_speed(void)         { return g_tts_speed; }
+static void _tts_set_speed(float v) {
+    g_tts_speed = v < 0.5f ? 0.5f : (v > 3.0f ? 3.0f : v);
+    // reinit engine dengan speed baru
+    if (g_tts_engine) init_tts_engine();
+}
+static void  _tts_set_pitch(float v)  { /* reserved */ }
+static void  _tts_set_volume(int v)   { /* reserved */ }
+static void  _tts_enable(void)        { g_tts_enabled = 1; }
+static void  _tts_disable(void)       { g_tts_enabled = 0; }
+static int   _tts_is_enabled(void)    { return g_tts_enabled; }
+static float _tts_get_pitch(void)     { return 1.0f; }
+static float _tts_get_speed(void)     { return g_tts_speed; }
 
 static void _tts_set_voice(const char* model_filename) {
     if (!model_filename || model_filename[0] == '\0') return;
-    snprintf(g_piper_model, sizeof(g_piper_model), "%s", model_filename);
-    LOGF("[TTS] model=%s", g_piper_model);
-}
-
-static void _tts_set_piper_rate(int rate) {
-    if (rate > 0) g_piper_rate = rate;
-    LOGF("[TTS] piper_rate=%d", g_piper_rate);
+    snprintf(g_model, sizeof(g_model), "%s", model_filename);
+    LOGF("[TTS] model=%s, reinit...", g_model);
+    init_tts_engine();
 }
 
 static void _tts_set_play_local(int v) {
     g_play_local = v;
     if (v) create_local_stream();
     else   destroy_local_stream();
-    LOGF("[TTS] play_local=%d", v);
 }
 static int _tts_get_play_local(void) { return g_play_local; }
+
+static void _tts_set_piper_rate(int v) { /* tidak dipakai, rate dari model */ }
 
 static void _tts_notify_mic_on(unsigned int handle) {
     if (handle && handle != g_hrecord) {
         g_hrecord = handle;
         if (pBASSChannelSetDSP)
             pBASSChannelSetDSP(handle, tts_dsp_proc, nullptr, 0);
-        LOGF("[TTS] notify_mic_on handle=%u", handle);
+        LOGF("[TTS] notify_mic_on=%u", handle);
     }
 }
 
-static int           _tts_pcm_avail(void)   {
+static int           _tts_pcm_avail(void) {
     pthread_mutex_lock(&g_pcm_mutex);
     int a = g_pcm_avail;
     pthread_mutex_unlock(&g_pcm_mutex);
     return a;
 }
-static unsigned int  _tts_get_hrecord(void) { return (unsigned int)g_hrecord; }
+static unsigned int  _tts_get_hrecord(void)       { return (unsigned int)g_hrecord; }
 static void          _tts_set_mic_pos(float x, float y) {
     g_mic_btn_x = x; g_mic_btn_y = y;
     LOGF("[TTS] mic_pos=%.0f,%.0f", x, y);
@@ -413,10 +453,10 @@ struct TtsAPI {
     int          (*pcm_avail)(void);
     unsigned int (*get_hrecord)(void);
     void         (*set_mic_pos)(float, float);
-    void         (*set_voice)(const char*);   // sekarang = nama file model .onnx
+    void         (*set_voice)(const char*);
     void         (*set_play_local)(int);
     int          (*get_play_local)(void);
-    void         (*set_piper_rate)(int);      // NEW: set sample rate model
+    void         (*set_piper_rate)(int);
 };
 
 #define EXPORT __attribute__((visibility("default")))
@@ -427,67 +467,94 @@ EXPORT TtsAPI tts_api = {
     _tts_speak, _tts_set_pitch, _tts_set_speed, _tts_set_volume,
     _tts_enable, _tts_disable, _tts_is_enabled, _tts_get_pitch, _tts_get_speed,
     _tts_notify_mic_on, _tts_pcm_avail, _tts_get_hrecord, _tts_set_mic_pos,
-    _tts_set_voice, _tts_set_play_local, _tts_get_play_local,
-    _tts_set_piper_rate,
+    _tts_set_voice, _tts_set_play_local, _tts_get_play_local, _tts_set_piper_rate,
 };
 
 EXPORT void* __GetModInfo() {
-    static const char* info = "libvoicetts|2.0|VoiceTTS Piper for SampVoice|brruham";
+    static const char* info = "libvoicetts|3.0|VoiceTTS sherpa-onnx/Piper|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    LOGF("[TTS] OnModPreLoad v2.0 (Piper)");
+    LOGF("[TTS] OnModPreLoad v3.0 (sherpa-onnx)");
 }
 
 EXPORT void OnModLoad() {
     LOGF("[TTS] OnModLoad start");
 
+    // Load sherpa-onnx via dlopen dari folder mod
+    // Coba dari beberapa path
+    const char* sherpa_paths[] = {
+        "/data/data/com.rockstargames.gtasa/files/AML/libsherpa-onnx-c-api.so",
+        "/sdcard/piper/libsherpa-onnx-c-api.so",
+        "libsherpa-onnx-c-api.so",
+        nullptr
+    };
+    for (int i = 0; sherpa_paths[i]; i++) {
+        g_sherpa_handle = dlopen(sherpa_paths[i], RTLD_NOW | RTLD_GLOBAL);
+        if (g_sherpa_handle) { LOGF("[TTS] sherpa loaded: %s", sherpa_paths[i]); break; }
+    }
+    if (!g_sherpa_handle) { LOGF("[TTS] ERROR: sherpa-onnx not found"); return; }
+
+    pCreateOfflineTts    = (decltype(pCreateOfflineTts))   dlsym(g_sherpa_handle, "SherpaOnnxCreateOfflineTts");
+    pDestroyOfflineTts   = (decltype(pDestroyOfflineTts))  dlsym(g_sherpa_handle, "SherpaOnnxDestroyOfflineTts");
+    pOfflineTtsGenerate  = (decltype(pOfflineTtsGenerate)) dlsym(g_sherpa_handle, "SherpaOnnxOfflineTtsGenerate");
+    pDestroyGeneratedAudio=(decltype(pDestroyGeneratedAudio))dlsym(g_sherpa_handle,"SherpaOnnxDestroyOfflineTtsGeneratedAudio");
+    pOfflineTtsSampleRate= (decltype(pOfflineTtsSampleRate))dlsym(g_sherpa_handle, "SherpaOnnxOfflineTtsSampleRate");
+
+    if (!pCreateOfflineTts || !pOfflineTtsGenerate) {
+        LOGF("[TTS] ERROR: sherpa symbols missing"); return;
+    }
+    LOGF("[TTS] sherpa symbols loaded");
+
+    // Init TTS engine
+    if (!init_tts_engine()) return;
+
+    // Dobby
     void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hDobby) { LOGF("[TTS] ERROR: libdobby"); return; }
     pDobbySymbolResolver = (void*(*)(const char*,const char*))dlsym(hDobby, "DobbySymbolResolver");
     pDobbyHook           = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
     if (!pDobbySymbolResolver || !pDobbyHook) { LOGF("[TTS] ERROR: Dobby sym"); return; }
 
+    // BASS
     void* hBASS = dlopen("libBASS.so", RTLD_NOW | RTLD_GLOBAL);
     if (!hBASS) { LOGF("[TTS] ERROR: libBASS"); return; }
 
-    pBASSStreamCreate        = (HSTREAM(*)(DWORD,DWORD,DWORD,STREAMPROC,void*))dlsym(hBASS, "BASS_StreamCreate");
-    pBASSStreamPutData       = (DWORD(*)(HSTREAM,const void*,DWORD))dlsym(hBASS, "BASS_StreamPutData");
-    pBASSChannelPlay         = (BOOL(*)(DWORD,BOOL))dlsym(hBASS, "BASS_ChannelPlay");
-    pBASSChannelSetDSP       = (HDSP(*)(DWORD,DSPPROC,void*,int))dlsym(hBASS, "BASS_ChannelSetDSP");
-    pBASSChannelStop         = (BOOL(*)(DWORD))dlsym(hBASS, "BASS_ChannelStop");
-    pBASSChannelSetAttribute = (BOOL(*)(DWORD,DWORD,float))dlsym(hBASS, "BASS_ChannelSetAttribute");
+    pBASSStreamCreate        = (HSTREAM(*)(DWORD,DWORD,DWORD,STREAMPROC,void*))dlsym(hBASS,"BASS_StreamCreate");
+    pBASSStreamPutData       = (DWORD(*)(HSTREAM,const void*,DWORD))dlsym(hBASS,"BASS_StreamPutData");
+    pBASSChannelPlay         = (BOOL(*)(DWORD,BOOL))dlsym(hBASS,"BASS_ChannelPlay");
+    pBASSChannelSetDSP       = (HDSP(*)(DWORD,DSPPROC,void*,int))dlsym(hBASS,"BASS_ChannelSetDSP");
+    pBASSChannelStop         = (BOOL(*)(DWORD))dlsym(hBASS,"BASS_ChannelStop");
+    pBASSChannelSetAttribute = (BOOL(*)(DWORD,DWORD,float))dlsym(hBASS,"BASS_ChannelSetAttribute");
 
     void* addrIsActive = dlsym(hBASS, "BASS_ChannelIsActive");
     if (addrIsActive)
-        pDobbyHook(addrIsActive, (void*)hook_BASSChannelIsActive, (void**)&orig_BASSChannelIsActive);
+        pDobbyHook(addrIsActive,(void*)hook_BASSChannelIsActive,(void**)&orig_BASSChannelIsActive);
 
-    void* addrRec = pDobbySymbolResolver("libBASS.so", "BASS_RecordStart");
-    if (!addrRec) { LOGF("[TTS] ERROR: BASS_RecordStart addr"); return; }
-    if (pDobbyHook(addrRec, (void*)hook_BASSRecordStart, (void**)&orig_BASSRecordStart) != 0) {
-        LOGF("[TTS] ERROR: DobbyHook RecordStart"); return;
-    }
+    void* addrRec = pDobbySymbolResolver("libBASS.so","BASS_RecordStart");
+    if (!addrRec) { LOGF("[TTS] ERROR: BASS_RecordStart"); return; }
+    pDobbyHook(addrRec,(void*)hook_BASSRecordStart,(void**)&orig_BASSRecordStart);
 
-    void* addrPause = pDobbySymbolResolver("libBASS.so", "BASS_ChannelPause");
+    void* addrPause = pDobbySymbolResolver("libBASS.so","BASS_ChannelPause");
     if (addrPause)
-        pDobbyHook(addrPause, (void*)hook_BASSChannelPause, (void**)&orig_BASSChannelPause);
+        pDobbyHook(addrPause,(void*)hook_BASSChannelPause,(void**)&orig_BASSChannelPause);
 
-    void* addrGetData = pDobbySymbolResolver("libBASS.so", "BASS_ChannelGetData");
+    void* addrGetData = pDobbySymbolResolver("libBASS.so","BASS_ChannelGetData");
     if (addrGetData)
-        pDobbyHook(addrGetData, (void*)hook_BASSChannelGetData, (void**)&orig_BASSChannelGetData);
+        pDobbyHook(addrGetData,(void*)hook_BASSChannelGetData,(void**)&orig_BASSChannelGetData);
 
     if (g_play_local) create_local_stream();
 
-    FILE* af = fopen("/storage/emulated/0/voicetts_addr.txt", "w");
-    if (af) { fprintf(af, "%lu\n", (unsigned long)&tts_api); fclose(af); }
+    FILE* af = fopen("/storage/emulated/0/voicetts_addr.txt","w");
+    if (af) { fprintf(af,"%lu\n",(unsigned long)&tts_api); fclose(af); }
 
     pthread_t thr;
-    pthread_create(&thr, nullptr, tts_transmit_thread, nullptr);
+    pthread_create(&thr,nullptr,tts_transmit_thread,nullptr);
     pthread_detach(thr);
 
-    LOGF("[TTS] OnModLoad SELESAI! model=%s rate=%d", g_piper_model, g_piper_rate);
+    LOGF("[TTS] OnModLoad SELESAI! model=%s", g_model);
 }
 
 } // extern "C"
