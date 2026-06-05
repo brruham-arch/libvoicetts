@@ -20,22 +20,59 @@ jobs:
         ndk-version: r25b
         add-to-path: true
 
-    - name: Build with CMake + NDK
+    - name: Cache espeak-ng
+      id: cache-espeak
+      uses: actions/cache@v4
+      with:
+        path: jni/espeak-ng
+        key: espeak-ng-${{ hashFiles('jni/Android.mk') }}
+
+    - name: Install dependencies
+      if: steps.cache-espeak.outputs.cache-hit != 'true'
+      run: |
+        # Hanya cmake dan make - tidak perlu libpcaudio/libsonic untuk host build Android
+        sudo apt-get install -y --no-install-recommends cmake make
+
+    - name: Clone eSpeak-NG
+      if: steps.cache-espeak.outputs.cache-hit != 'true'
+      run: git clone --depth=1 https://github.com/espeak-ng/espeak-ng.git jni/espeak-ng
+
+    - name: Build eSpeak-NG host (generates phondata)
+      if: steps.cache-espeak.outputs.cache-hit != 'true'
+      run: |
+        cd jni/espeak-ng
+        cmake -B build_host \
+          -DUSE_ASYNC=OFF \
+          -DBUILD_SHARED_LIBS=OFF \
+          -DESPEAK_NG_DEFAULT_VOICE=id \
+          .
+        cmake --build build_host -j4
+        PHDATA=$(find build_host -name "phondata" 2>/dev/null | head -1)
+        if [ -z "$PHDATA" ]; then echo "ERROR: phondata not found"; exit 1; fi
+        cp -r "$(dirname $PHDATA)"/. espeak-ng-data/
+        echo "phondata: $(wc -c < espeak-ng-data/phondata)"
+
+    - name: Copy config.h
+      run: cp jni/config.h jni/espeak-ng/src/config.h
+
+    - name: Generate Android.mk
+      run: python3 gen_mk.py
+
+    - name: Build with NDK
       env:
         ANDROID_NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
       run: |
-        cmake -B build \
-          -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
-          -DANDROID_ABI=armeabi-v7a \
-          -DANDROID_PLATFORM=android-19 \
-          -DCMAKE_BUILD_TYPE=Release \
-          .
-        cmake --build build -j4
+        $ANDROID_NDK/ndk-build NDK_PROJECT_PATH=. \
+          APP_BUILD_SCRIPT=jni/Android.mk \
+          NDK_APPLICATION_MK=jni/Application.mk \
+          -j4
 
     - name: Collect output
       run: |
-        mkdir -p out
-        find build -name "*.so" -not -path "*/CMakeFiles/*" -exec cp {} out/ \;
+        mkdir -p out/espeak-ng-data
+        find libs/ -name "*.so" -exec cp {} out/ \;
+        cp -r jni/espeak-ng/espeak-ng-data/. out/espeak-ng-data/
+        echo "phondata: $(wc -c < out/espeak-ng-data/phondata)"
         ls -lh out/
 
     - name: Upload artifact
